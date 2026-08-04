@@ -51,6 +51,7 @@
 #define LOG_DIR  "/data/ghostpad"
 #define LOG_PATH "/data/ghostpad/gc_status.log"
 #define PID_PATH "/data/ghostpad/gc_main.pid"
+#define HANDOFF_PATH "/data/ghostpad/gc_handoff.ready"
 #define LOG_MAX  480
 
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -78,6 +79,83 @@ void ghostpad_status_log(const char *fmt, ...) {
     pthread_mutex_unlock(&g_log_lock);
 }
 #define gp_log(...) ghostpad_status_log("[GC] " __VA_ARGS__)
+
+/* Declared before replacement-handoff helpers because the manager consumes
+ * the deadline later, after its slot state has been initialized. */
+static volatile uint64_t g_usb_settle_until_ms = 0;
+
+static uint64_t uptime_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000u + (uint64_t)tv.tv_usec / 1000u;
+}
+
+static int pid_is_alive(pid_t pid) {
+    if (pid <= 0)
+        return 0;
+    return kill(pid, 0) == 0 || errno == EPERM;
+}
+
+static int handoff_acknowledged(pid_t expected_pid) {
+    char buf[24] = {0};
+    int fd = open(HANDOFF_PATH, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t len = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    return len > 0 && (pid_t)atoi(buf) == expected_pid;
+}
+
+static void write_handoff_ack(void) {
+    char buf[24];
+    int len = snprintf(buf, sizeof(buf), "%d\n", getpid());
+    int fd = open(HANDOFF_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        write(fd, buf, (size_t)len);
+        close(fd);
+    }
+}
+
+/* A replacement payload must not touch /dev/ugen until the old payload has
+ * released USB_FS.  The acknowledgement is used by new builds; liveness is
+ * retained as a safe fallback when replacing an older payload. */
+static void wait_for_previous_instance(void) {
+    char buf[24] = {0};
+    int fd = open(PID_PATH, O_RDONLY);
+    if (fd < 0)
+        return;
+    read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    pid_t old = (pid_t)atoi(buf);
+    if (old <= 0 || old == getpid())
+        return;
+
+    unlink(HANDOFF_PATH); /* never accept an acknowledgement from an older run */
+    gp_log("handoff: requesting shutdown from pid=%d\n", old);
+    if (kill(old, SIGTERM) != 0 && errno != ESRCH)
+        gp_log("handoff: SIGTERM pid=%d errno=%d\n", old, errno);
+
+    int acknowledged = 0;
+    for (int pass = 0; pass < 50; pass++) { /* up to 5 seconds */
+        if (handoff_acknowledged(old)) {
+            acknowledged = 1;
+            gp_log("handoff: pid=%d confirmed USB release\n", old);
+            break;
+        }
+        if (!pid_is_alive(old)) {
+            gp_log("handoff: pid=%d exited without acknowledgement\n", old);
+            break;
+        }
+        usleep(100000);
+    }
+    if (!acknowledged && pid_is_alive(old))
+        gp_log("handoff: pid=%d did not exit in time; continuing cautiously\n", old);
+
+    /* The X10 can re-enumerate after USB_FS ownership changes.  Give it a
+     * quiet interval before discovery; the warm-up gate below verifies it. */
+    g_usb_settle_until_ms = uptime_ms() + 1500;
+}
 
 /* ── SCE stubs ────────────────────────────────────────────────────────── */
 extern int32_t sceUserServiceInitialize(void *params);
@@ -120,6 +198,7 @@ static pthread_mutex_t g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
  * from discovery until the USB reader owns it. */
 static int             g_x10_preopen_fd = -1;
 static char            g_x10_preopen_path[32];
+static volatile sig_atomic_t g_shutdown_requested = 0;
 static int32_t         g_inject_uid = 0x10000000;
 static volatile uint64_t g_last_physical_pad_dev = 0;
 static volatile uint64_t g_pending_physical_recover_dev = 0;
@@ -355,7 +434,7 @@ static void *klog_capture_thread(void *arg) {
         }
         if (fd<0){close(sock);return NULL;}
     }
-    while (1) {
+    while (!g_shutdown_requested) {
         ssize_t len = read(fd, buf, sizeof(buf));
         if (len < 0) { if (errno==EINTR) continue; break; }
         if (len == 0) { usleep(10000); continue; }
@@ -1066,6 +1145,152 @@ static int open_switch_input_endpoint(int fd, int slot, const char *pass,
     return -1;
 }
 
+/* The X10 sometimes drops off the bus once immediately after a previous
+ * USB_FS owner exits.  Verify its nonstandard 0x84 endpoint before creating
+ * a VDA, so that recovery is invisible rather than producing a chain of
+ * assignment dialogs.  The caller keeps fd open for the later reader. */
+static int x10_warmup_fd(int fd, const char *path) {
+    struct usb_fs_endpoint eps[1];
+    struct usb_fs_init init;
+    struct usb_fs_open input;
+    struct usb_fs_start start;
+    struct usb_fs_complete complete;
+    struct usb_fs_stop stop;
+    struct usb_fs_close close_ep;
+    struct usb_fs_uninit uninit;
+    uint8_t buf[64];
+    void *buffers[1] = { buf };
+    uint32_t lengths[1] = { sizeof(buf) };
+    uint8_t endpoint = 0;
+    int input_open = 0;
+    int reports = 0;
+    int result = 0; /* 0 = not X10 / no gate, 1 = stable, -1 = retry */
+
+    memset(eps, 0, sizeof(eps));
+    memset(&init, 0, sizeof(init));
+    init.pEndpoints = eps;
+    init.ep_index_max = 1;
+    if (ioctl(fd, USB_FS_INIT, &init) != 0) {
+        gp_log("X10 warm-up: %s FS_INIT errno=%d; retrying quietly\n", path, errno);
+        return -1;
+    }
+
+    { int i0 = 0, i1 = 1;
+      ioctl(fd, USB_IFACE_DRIVER_DETACH, &i0);
+      ioctl(fd, USB_IFACE_DRIVER_DETACH, &i1); }
+
+    if (open_switch_input_endpoint(fd, -1, "warm-up", &input, &endpoint) != 0) {
+        gp_log("X10 warm-up: %s has no usable Switch input errno=%d\n", path, errno);
+        result = -1;
+        goto done;
+    }
+    input_open = 1;
+
+    /* Regular Switch-compatible pads retain the original flow.  Endpoint
+     * 0x84 is the hardware-observed EasySMX X10 fingerprint. */
+    if (endpoint != 0x84) {
+        result = 0;
+        goto done;
+    }
+
+    eps[0].ppBuffer = buffers;
+    eps[0].pLength = lengths;
+    eps[0].nFrames = 1;
+    eps[0].timeout = 150;
+    eps[0].flags = USB_FS_FLAG_SINGLE_SHORT_OK | USB_FS_FLAG_MULTI_SHORT_OK;
+
+    for (int pass = 0; pass < 24 && reports < 8; pass++) {
+        memset(buf, 0, sizeof(buf));
+        lengths[0] = sizeof(buf);
+        memset(&start, 0, sizeof(start));
+        start.ep_index = 0;
+        if (ioctl(fd, USB_FS_START, &start) != 0) {
+            gp_log("X10 warm-up: START errno=%d\n", errno);
+            result = -1;
+            goto done;
+        }
+
+        int completed = 0;
+        for (int wait = 0; wait < 60; wait++) {
+            memset(&complete, 0, sizeof(complete));
+            complete.ep_index = 0;
+            if (ioctl(fd, USB_FS_COMPLETE, &complete) == 0) {
+                completed = 1;
+                break;
+            }
+            if (errno == ENXIO || errno == ENOTTY) {
+                gp_log("X10 warm-up: COMPLETE errno=%d; device reset\n", errno);
+                result = -1;
+                goto done;
+            }
+            if (errno != EBUSY) {
+                gp_log("X10 warm-up: COMPLETE errno=%d\n", errno);
+                result = -1;
+                goto done;
+            }
+            usleep(1000);
+        }
+        if (!completed) {
+            memset(&stop, 0, sizeof(stop));
+            stop.ep_index = 0;
+            ioctl(fd, USB_FS_STOP, &stop);
+            continue;
+        }
+        if (lengths[0] > 0)
+            reports++;
+    }
+
+    if (reports >= 8) {
+        gp_log("X10 warm-up: %s stable (%d reports)\n", path, reports);
+        result = 1;
+    } else {
+        gp_log("X10 warm-up: %s timed out after %d reports\n", path, reports);
+        result = -1;
+    }
+
+done:
+    memset(&stop, 0, sizeof(stop));
+    stop.ep_index = 0;
+    ioctl(fd, USB_FS_STOP, &stop);
+    if (input_open) {
+        memset(&close_ep, 0, sizeof(close_ep));
+        close_ep.ep_index = 0;
+        ioctl(fd, USB_FS_CLOSE, &close_ep);
+    }
+    memset(&uninit, 0, sizeof(uninit));
+    ioctl(fd, USB_FS_UNINIT, &uninit);
+    return result;
+}
+
+/* USB_FS_INIT carries per-file state.  Warm-up intentionally closes its
+ * session with USB_FS_UNINIT, but the real reader must use a fresh descriptor
+ * rather than attempt a second initialization on that same file object. */
+static int x10_refresh_preopened_fd(const char *path, int *fd) {
+    if (!fd || *fd < 0)
+        return -1;
+    close(*fd);
+    *fd = -1;
+    usleep(100000);
+    *fd = open(path, O_RDWR | O_NONBLOCK);
+    if (*fd < 0) {
+        gp_log("X10 warm-up: fresh descriptor open errno=%d\n", errno);
+        return -1;
+    }
+    gp_log("X10 warm-up: fresh descriptor retained for VDA setup\n");
+    return 0;
+}
+
+static void x10_connection_pulse(int fd, struct usb_fs_endpoint *out_ep, int slot) {
+    static const uint8_t rumble[] = { 0x10, 0x00, 0x68, 0x5a, 0xba,
+                                      0x56, 0x98, 0x5a, 0xc6, 0x56 };
+    static const uint8_t stop[]   = { 0x10, 0x01, 0x68, 0x00, 0x3a,
+                                      0x40, 0x98, 0x00, 0x46, 0x40 };
+    int start_ret = usb_send_out(fd, out_ep, rumble, sizeof(rumble), "x10-ready");
+    usleep(180000);
+    int stop_ret = usb_send_out(fd, out_ep, stop, sizeof(stop), "x10-stop");
+    gp_log("slot[%d] X10 ready rumble start=%d stop=%d\n", slot, start_ret, stop_ret);
+}
+
 static void *usb_hid_thread(void *arg) {
     usb_thread_arg_t *targ = (usb_thread_arg_t *)arg;
     int slot = targ->slot;
@@ -1085,6 +1310,7 @@ static void *usb_hid_thread(void *arg) {
     uint8_t  buf[64];
     void    *buffers[1]; uint32_t lengths[1];
     int fd = preopened_fd, out_opened = 0;
+    uint8_t switch_out_ep = 0;
     int switch_out_try;
     int x10_raw_log_count = 0;
     int x10_have_last_raw = 0;
@@ -1314,6 +1540,7 @@ static void *usb_hid_thread(void *arg) {
         fs_open.max_frames=1;
         out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
         if (out_opened) {
+            switch_out_ep = fs_open.ep_no;
             gp_log("slot[%d] Switch OUT ep=0x%02x\n", slot, fs_open.ep_no);
             break;
         }
@@ -1334,9 +1561,11 @@ main_loop: ;
     int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput ||
                     switch_in_ep != 0x81) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
+    int x10_ready_pulse_pending = (is_mamba_switch && switch_in_ep == 0x84 &&
+                                   switch_out_ep == 0x03 && out_opened);
     g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
-    while (1) {
+    while (!g_shutdown_requested) {
         if (g_slots[slot].release_requested) {
             gp_log("slot[%d] release requested - pausing VDA only\n", slot);
             release_mamba_vda_only(slot, "official same user reclaim");
@@ -1461,6 +1690,10 @@ main_loop: ;
         }
 
         if (injected > 0) {
+            if (x10_ready_pulse_pending) {
+                x10_ready_pulse_pending = 0;
+                x10_connection_pulse(fd, &eps[1], slot);
+            }
             if (!usb_ready_notified) {
                 notify("Ghost-Control by StonedModder: slot[%d] streaming - controller active", slot);
                 usb_ready_notified = 1;
@@ -1536,7 +1769,15 @@ static void *controller_manager_thread(void *arg) {
     int scan = 0;
     gp_log("Manager thread started (MAX_SLOTS=%d)\n", MAX_SLOTS);
 
-    while (1) {
+    while (!g_shutdown_requested) {
+        uint64_t now = uptime_ms();
+        if (now < g_usb_settle_until_ms) {
+            uint64_t wait_ms = g_usb_settle_until_ms - now;
+            gp_log("manager: waiting %llums for USB handoff to settle\n",
+                   (unsigned long long)wait_ms);
+            usleep((useconds_t)(wait_ms * 1000u));
+            continue;
+        }
         /* Snapshot every /dev/ugen*.* this scan pass — beats a hardcoded
          * list when the XIM/controller lands on an unexpected path
          * (ugen2.10+, ugen3.*, etc). Skip root hub (.1) entries. */
@@ -1559,6 +1800,8 @@ static void *controller_manager_thread(void *arg) {
         if ((scan % 5) == 0) gp_log("manager: scan #%d — %d ugen paths\n", scan, n_paths);
 
         for (int i = 0; i < n_paths; i++) {
+            if (g_shutdown_requested)
+                break;
             const char *path = ugen_paths[i];
 
             /* Serialize assignment: if a controller is still awaiting the user's
@@ -1585,6 +1828,31 @@ static void *controller_manager_thread(void *arg) {
                     gp_log("manager: %s ignored because another Manba slot is active\n", path);
                 continue;
             }
+
+            /* Do not create an assignment dialog while an X10 is still
+             * rebooting from a previous USB owner.  The descriptor remains
+             * held and is passed to the real USB thread after it is stable. */
+            if (vid == MAMBA_SWITCH_VID && pid == MAMBA_SWITCH_PID) {
+                int x10_fd = x10_take_preopened_fd(path);
+                if (x10_fd >= 0) {
+                    int warmup = x10_warmup_fd(x10_fd, path);
+                    if (warmup < 0) {
+                        close(x10_fd);
+                        g_usb_settle_until_ms = uptime_ms() + 1500;
+                        gp_log("manager: X10 warm-up reset; delaying retry without VDA\n");
+                        continue;
+                    }
+                    if (warmup > 0 && x10_refresh_preopened_fd(path, &x10_fd) != 0) {
+                        g_usb_settle_until_ms = uptime_ms() + 1500;
+                        gp_log("manager: X10 descriptor refresh failed; delaying retry without VDA\n");
+                        continue;
+                    }
+                    x10_hold_preopened_fd(path, &x10_fd);
+                }
+            }
+
+            if (g_shutdown_requested)
+                break;
 
             /* Find free slot */
             int slot = -1;
@@ -1738,13 +2006,28 @@ static void elevate_credentials(void) {
 }
 
 /* ── main ─────────────────────────────────────────────────────────────── */
-/* Clean USB teardown on termination. When a new payload instance kills this one
- * (SIGTERM), release every claimed ugen device so the controller is left in a
- * clean state — otherwise the killed payload leaves endpoints open / the driver
- * detached, and the next instance can't re-handshake without a physical replug.
- * close()/_exit() are async-signal-safe; the USB ioctls run at process death. */
-static void cleanup_and_exit(int sig) {
+/* Signal context is deliberately minimal.  USB ioctls and virtual-pad calls
+ * are not async-signal-safe; the regular thread paths below own teardown. */
+static void request_shutdown(int sig) {
     (void)sig;
+    g_shutdown_requested = 1;
+}
+
+static int active_slot_count(void) {
+    int active = 0;
+    for (int s = 0; s < MAX_SLOTS; s++)
+        if (g_slots[s].usb_active)
+            active++;
+    return active;
+}
+
+static void graceful_shutdown_and_exit(void) {
+    gp_log("handoff: shutdown requested; waiting for USB threads\n");
+    for (int pass = 0; pass < 50 && active_slot_count() > 0; pass++)
+        usleep(100000);
+
+    /* The normal USB-thread exit path should have released every endpoint.
+     * This is only a final safety net for a thread that never reached it. */
     for (int s = 0; s < MAX_SLOTS; s++) {
         int fd = g_slots[s].usb_fd;
         if (fd >= 0) {
@@ -1762,6 +2045,12 @@ static void cleanup_and_exit(int sig) {
         if (g_slots[s].handle >= 0)
             scePadVirtualDeviceDeleteDevice(g_slots[s].handle);
     }
+
+    int preopen = x10_take_preopened_fd(g_x10_preopen_path);
+    if (preopen >= 0)
+        close(preopen);
+    write_handoff_ack();
+    gp_log("handoff: USB release complete\n");
     _exit(0);
 }
 
@@ -1769,17 +2058,12 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control with EasySMX X10 support starting - %d slots\n", MAX_SLOTS);
-    notify("Ghost-Control: EasySMX X10 support");
+    gp_log("Ghost-Control EasySMX X10 handoff-stability v2 starting - %d slots\n", MAX_SLOTS);
+    notify("Ghost-Control: X10 handoff-stability v2");
 
-    /* Kill previous instance */
-    { int pfd=open(PID_PATH,O_RDONLY);
-      if(pfd>=0){char pb[16]={0};read(pfd,pb,15);close(pfd);
-        pid_t old=(pid_t)atoi(pb);
-        if(old>0&&old!=getpid()){gp_log("Killing prev pid=%d\n",old);kill(old,SIGTERM);usleep(1200000);}
-      }
-      int pfd2=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
-      if(pfd2>=0){char pb[16];snprintf(pb,sizeof(pb),"%d",getpid());write(pfd2,pb,strlen(pb));close(pfd2);}
+    wait_for_previous_instance();
+    { int pfd=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
+      if(pfd>=0){char pb[16];snprintf(pb,sizeof(pb),"%d",getpid());write(pfd,pb,strlen(pb));close(pfd);}
     }
 
     /* Init slots */
@@ -1799,9 +2083,9 @@ int main(void) {
     }
     g_assign_slot = -1;
 
-    /* Clean teardown when the next deploy kills us — releases the controllers */
-    signal(SIGTERM, cleanup_and_exit);
-    signal(SIGINT,  cleanup_and_exit);
+    /* A replacement asks us to stop; main coordinates the USB handoff. */
+    signal(SIGTERM, request_shutdown);
+    signal(SIGINT,  request_shutdown);
 
     sceUserServiceInitialize(NULL);
     sceUserServiceGetInitialUser(&userId);
@@ -1838,7 +2122,7 @@ int main(void) {
 
     /* Keep-alive */
     uint32_t tick = 0;
-    while (1) {
+    while (!g_shutdown_requested) {
         usleep(1000000);
         tick++;
         if (tick % 10 == 0) {
@@ -1847,5 +2131,6 @@ int main(void) {
             gp_log("alive tick=%u active_slots=%d\n", tick, active);
         }
     }
-    return 0;
+    graceful_shutdown_and_exit();
+    return 0; /* unreachable */
 }
