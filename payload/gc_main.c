@@ -891,6 +891,14 @@ static int x10_take_preopened_fd(const char *path) {
     return fd;
 }
 
+static void x10_discard_preopened_fd(const char *path) {
+    int fd = x10_take_preopened_fd(path);
+    if (fd >= 0) {
+        gp_log("X10 pre-open: discarding inactive candidate %s\n", path);
+        close(fd);
+    }
+}
+
 /* Probe a /dev/ugen* path to identify controller type.
  * Returns 1 with vid/pid set, 0 if not a known controller.
  *
@@ -1073,13 +1081,7 @@ static int32_t create_vda_for_slot(int slot) {
         handle = (int32_t)(dev_id & 0xffffffffu);
         gp_log("slot[%d] using local VDA handle=0x%x for VDI\n",
                slot, (uint32_t)handle);
-        if (g_slots[slot].vid == MAMBA_SWITCH_VID &&
-            g_slots[slot].pid == MAMBA_SWITCH_PID) {
-            gp_log("slot[%d] X10: deferring physical-pad sweep until USB is claimed\n",
-                   slot);
-        } else {
-            maybe_disconnect_physical_pad_for_slot(slot);
-        }
+        maybe_disconnect_physical_pad_for_slot(slot);
     } else if (handle >= 0) {
         gp_log("slot[%d] klog timeout — using direct handle %d\n", slot, handle);
     } else {
@@ -1118,7 +1120,9 @@ typedef struct {
 static int open_switch_input_endpoint(int fd, int slot, const char *pass,
                                       struct usb_fs_open *out_open,
                                       uint8_t *out_ep) {
-    static const uint8_t candidates[] = { 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87 };
+    /* Keep the existing Switch profile (0x81) unchanged.  X10 is the only
+     * additional hardware-tested profile, with interrupt IN at 0x84. */
+    static const uint8_t candidates[] = { 0x81, 0x84 };
     size_t i;
     int last_errno = EINVAL;
 
@@ -1310,6 +1314,7 @@ static void *usb_hid_thread(void *arg) {
     uint8_t  buf[64];
     void    *buffers[1]; uint32_t lengths[1];
     int fd = preopened_fd, out_opened = 0;
+    uint8_t switch_in_ep = 0;
     uint8_t switch_out_ep = 0;
     int switch_out_try;
     int x10_raw_log_count = 0;
@@ -1473,7 +1478,6 @@ static void *usb_hid_thread(void *arg) {
     }
 
     /* ── Nintendo/Switch HID: two-pass ─────────────────────────────────── */
-    uint8_t switch_in_ep = 0;
     if (fd >= 0)
         gp_log("slot[%d] X10 using pre-opened USB fd\n", slot);
     else
@@ -1527,12 +1531,16 @@ static void *usb_hid_thread(void *arg) {
     eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
     eps[0].timeout=200; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
 
-    /* 8BitDo uses ep=0x02; real Switch uses ep=0x01.  The X10 uses a
-     * nonstandard IN endpoint, so probe the nearby OUT endpoints too. */
-    static const uint8_t switch_out_candidates[] = { 0x02, 0x01, 0x03, 0x04, 0x05 };
-    for (switch_out_try = 0;
-         switch_out_try < (int)sizeof(switch_out_candidates);
-         switch_out_try++) {
+    /* Standard Switch remains 0x02/0x01.  X10's only verified output
+     * endpoint is 0x03, so unknown 057e:2009 layouts are not adopted. */
+    static const uint8_t standard_out_candidates[] = { 0x02, 0x01 };
+    static const uint8_t x10_out_candidates[] = { 0x03 };
+    const uint8_t *switch_out_candidates =
+        switch_in_ep == 0x84 ? x10_out_candidates : standard_out_candidates;
+    int switch_out_count =
+        switch_in_ep == 0x84 ? (int)sizeof(x10_out_candidates) :
+                               (int)sizeof(standard_out_candidates);
+    for (switch_out_try = 0; switch_out_try < switch_out_count; switch_out_try++) {
         memset(&fs_open,0,sizeof(fs_open));
         fs_open.ep_index=1;
         fs_open.ep_no=switch_out_candidates[switch_out_try];
@@ -1546,20 +1554,25 @@ static void *usb_hid_thread(void *arg) {
         }
     }
     gp_log("slot[%d] Switch OUT opened=%d\n", slot, out_opened);
+    if (switch_in_ep == 0x84 && (!out_opened || switch_out_ep != 0x03)) {
+        gp_log("slot[%d] X10 profile rejected: expected OUT ep=0x03\n", slot);
+        goto reinit;
+    }
     if (out_opened && switch_in_ep == 0x81) {
         usb_send_cmd(fd,&eps[1],0x80,0x02); usleep(30000);
         usb_send_cmd(fd,&eps[1],0x80,0x04); usleep(50000);
         gp_log("slot[%d] Nintendo [80 02]+[80 04] sent\n", slot);
     } else if (out_opened) {
-        gp_log("slot[%d] X10 nonstandard endpoint: skipping Nintendo init commands\n", slot);
+        gp_log("slot[%d] X10 profile: skipping Nintendo init commands\n", slot);
     }
 
 main_loop: ;
     int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
     int is_mamba_xinput = mamba_is_xinput_vidpid(vid, pid);
     int is_mamba_switch = mamba_is_switch_vidpid(vid, pid);
+    int is_x10_profile = (switch_in_ep == 0x84 && switch_out_ep == 0x03);
     int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput ||
-                    switch_in_ep != 0x81) ? HS_STREAMING : HS_WAIT_81_01;
+                    is_x10_profile) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     int x10_ready_pulse_pending = (is_mamba_switch && switch_in_ep == 0x84 &&
                                    switch_out_ep == 0x03 && out_opened);
@@ -1606,7 +1619,7 @@ main_loop: ;
 
         uint32_t len = lengths[0];
 
-        if (is_mamba_switch && switch_in_ep != 0x81 && x10_raw_log_count < 16) {
+        if (is_x10_profile && x10_raw_log_count < 16) {
             uint8_t b1 = len > 1 ? buf[1] : 0;
             uint8_t b2 = len > 2 ? buf[2] : 0;
             uint8_t b3 = len > 3 ? buf[3] : 0;
@@ -1641,7 +1654,7 @@ main_loop: ;
                 /* The X10's nonstandard 0x84 Switch endpoint reports right-Y
                  * opposite to the virtual DualSense convention. Standard
                  * Switch endpoint 0x81 devices retain their existing path. */
-                if (switch_in_ep != 0x81)
+                if (is_x10_profile)
                     pad.rightStick.y = (uint8_t)(255u - pad.rightStick.y);
             }
         }
@@ -1704,19 +1717,9 @@ main_loop: ;
                 g_slots[slot].confirmed = 1;
                 if (g_assign_slot == slot) g_assign_slot = -1;
                 gp_log("slot[%d] assignment confirmed (button press)\n", slot);
-                /* Switch-compatible pads defer physical-pad removal during
-                 * VDA setup because the X10 can lose its ugen node then. The
-                 * USB endpoint is now claimed and the user selected this
-                 * virtual pad, so complete the handoff before a game opens
-                 * the competing physical DualSense. */
-                if (is_mamba_switch) {
-                    gp_log("slot[%d] Switch assignment confirmed; handing off physical controller\n",
-                           slot);
-                    maybe_disconnect_physical_pad_for_slot(slot);
-                }
             }
             inject_pad(slot, &pad);
-            if (!is_mamba_switch && (g_slots[slot].inject_count % 600) == 0)
+            if ((g_slots[slot].inject_count % 600) == 0)
                 maybe_disconnect_physical_pad_for_slot(slot);
         }
     }
@@ -1826,6 +1829,8 @@ static void *controller_manager_thread(void *arg) {
             if (mamba_is_supported_vidpid(vid, pid) && any_mamba_slot_active()) {
                 if ((scan % 5) == 0)
                     gp_log("manager: %s ignored because another Manba slot is active\n", path);
+                if (vid == MAMBA_SWITCH_VID && pid == MAMBA_SWITCH_PID)
+                    x10_discard_preopened_fd(path);
                 continue;
             }
 
