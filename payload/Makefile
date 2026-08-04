@@ -1,6 +1,6 @@
 PS5_HOST ?=
 PORT     ?= 9021
-TARGET   := ghost-control-manba-v2-nbjr.elf
+TARGET   := ghost-control-easysmx-x10.elf
 
 ifndef PS5_PAYLOAD_SDK
 $(error PS5_PAYLOAD_SDK is not set)

@@ -69,6 +69,7 @@ Log `max_packet_length` from the open result — it tells you the expected HID r
 | Controller Family | IN | OUT | Report Size |
 |------------------|----|-----|------------|
 | Nintendo Pro / 8BitDo Nintendo mode | 0x81 | 0x02 | 64 bytes |
+| EasySMX X10 in Switch mode | 0x84 | 0x03 | 64 bytes |
 | Xbox 360 (wired) | 0x81 | 0x02 | 20 bytes (IN), 8 bytes (OUT) |
 | Xbox One / Series (wired) | 0x81 | 0x02 | 18 bytes (IN) |
 | Generic HID gamepad | 0x81 | 0x01 | varies |
@@ -88,6 +89,10 @@ USB_FS_OPEN(ep_no=0x81, ep_index=0);
 ```
 
 Check if `USB_FS_COMPLETE` returns data within 500ms with no OUT sent. If yes: native HID, skip all init.
+
+### Switch-compatible controllers with nonstandard endpoints
+
+Do not assume every controller reporting `057e:2009` is a standard Switch Pro device. The hardware-tested EasySMX X10 uses IN `0x84` and OUT `0x03`; it streams standard `0x30` reports after its input endpoint is opened, but disconnects if the usual Nintendo `[80 02]` / `[80 04]` initialization commands are sent. Its descriptor FD is therefore held from discovery through virtual-device assignment, then transferred to the USB reader before claiming endpoints.
 
 ### Xbox 360 (Wired)
 

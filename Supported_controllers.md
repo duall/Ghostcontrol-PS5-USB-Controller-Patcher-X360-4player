@@ -11,6 +11,7 @@ For how to add new devices, see [othercontrollersGuide.md](othercontrollersGuide
 | Controller | Mode | VID:PID | Parser / path | Notes |
 |------------|------|---------|---------------|-------|
 | 8BitDo Ultimate 2 | Nintendo Switch Pro | `057e:2009` | Nintendo / Manba Switch | Original confirmed path; IN `0x81`, 64-byte reports |
+| EasySMX X10 | Switch mode (rear switch) | `057e:2009` | Nintendo parser, nonstandard endpoint path | IN `0x84`, OUT `0x03`, 64-byte reports. The normal Nintendo init commands are skipped; a USB descriptor FD is held through virtual-pad assignment to avoid a PS5 `/dev/ugen` timing race. Right-stick Y is normalized for the virtual DualSense. After X10 assignment is confirmed, Ghostcontrol releases the competing physical DualSense for that user. |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | `2dc8:310a` | Manba XUSB (reuse) | Composite device: IN `0x84`, OUT `0x05` (not classic `0x81`/`0x01`). USB-C cable and 2.4G dongle. Merged in [#19](https://github.com/StonedModder/Ghostcontrol-PS5-USB-Controller-Patcher/pull/19). |
 
 ---
@@ -28,7 +29,7 @@ For how to add new devices, see [othercontrollersGuide.md](othercontrollersGuide
 | Mode | Detection | Endpoints (typical) | Status |
 |------|-----------|---------------------|--------|
 | PC / XInput | `045e:028e` or USB interface subclass `0x5d`, protocol `0x01` | IN `0x81`, OUT `0x02` or `0x01` | Routed via `controller_mamba.c` |
-| Switch USB | `057e:2009` | IN `0x81`, 64-byte HID | Same VID:PID as Switch Pro clones; shares Nintendo-style path |
+| Switch USB | `057e:2009` | Usually IN `0x81`, 64-byte HID | Standard Switch Pro clones use the normal path. The EasySMX X10 uses the same VID:PID but is identified by its usable IN `0x84` / OUT `0x03` endpoint pair at runtime. |
 
 ---
 

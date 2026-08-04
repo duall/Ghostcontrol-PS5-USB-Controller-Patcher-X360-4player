@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. Release tags use semver (`1.0.x`).
 
+## Unreleased
+
+### Added
+
+- **EasySMX X10** hardware-tested support in Switch mode (`057e:2009`): nonstandard USB endpoints IN `0x84` / OUT `0x03`, using the existing Nintendo report parser.
+
+### Fixed
+
+- Hold the X10 descriptor FD through virtual-device assignment, preventing the PS5 `/dev/ugen` node timing race that previously caused repeated connect/disconnect attempts.
+- Skip standard Nintendo initialization commands for the X10, which otherwise reset the controller.
+- Complete the delayed physical-controller handoff after X10 assignment is confirmed, so games use the virtual controller instead of a concurrently connected DualSense.
+- Normalize the X10's right-stick vertical axis for the virtual DualSense.
+
 ## [1.0.5] — 2026-07-05
 
 ### Added

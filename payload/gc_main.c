@@ -115,6 +115,11 @@ typedef struct {
 
 static ctrl_slot_t     g_slots[MAX_SLOTS];
 static pthread_mutex_t g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The X10 can briefly remove its /dev/ugen node while the virtual-pad
+ * assignment UI is being created. Keep the non-destructive descriptor FD
+ * from discovery until the USB reader owns it. */
+static int             g_x10_preopen_fd = -1;
+static char            g_x10_preopen_path[32];
 static int32_t         g_inject_uid = 0x10000000;
 static volatile uint64_t g_last_physical_pad_dev = 0;
 static volatile uint64_t g_pending_physical_recover_dev = 0;
@@ -775,6 +780,38 @@ static void maybe_stop_mamba_for_same_user_physical_open(uint64_t dev_id,
     request_release_mamba_slot(slot, "official same user reclaim");
 }
 
+static void x10_hold_preopened_fd(const char *path, int *fd) {
+    int held = 0;
+
+    if (!fd || *fd < 0)
+        return;
+    pthread_mutex_lock(&g_slot_lock);
+    if (g_x10_preopen_fd < 0) {
+        g_x10_preopen_fd = *fd;
+        strncpy(g_x10_preopen_path, path, sizeof(g_x10_preopen_path) - 1);
+        g_x10_preopen_path[sizeof(g_x10_preopen_path) - 1] = '\0';
+        *fd = -1;
+        held = 1;
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+    if (held)
+        gp_log("X10 pre-open: holding %s through virtual-pad setup\n", path);
+}
+
+static int x10_take_preopened_fd(const char *path) {
+    int fd = -1;
+
+    pthread_mutex_lock(&g_slot_lock);
+    if (g_x10_preopen_fd >= 0 &&
+        strcmp(g_x10_preopen_path, path) == 0) {
+        fd = g_x10_preopen_fd;
+        g_x10_preopen_fd = -1;
+        g_x10_preopen_path[0] = '\0';
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+    return fd;
+}
+
 /* Probe a /dev/ugen* path to identify controller type.
  * Returns 1 with vid/pid set, 0 if not a known controller.
  *
@@ -851,7 +888,10 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
             }
 
             if (match_known_vidpid(vid, pid, out_vid, out_pid)) {
-                close(fd);
+                if (vid == MAMBA_SWITCH_VID && pid == MAMBA_SWITCH_PID)
+                    x10_hold_preopened_fd(path, &fd);
+                if (fd >= 0)
+                    close(fd);
                 return 1;
             }
         } else {
@@ -954,7 +994,13 @@ static int32_t create_vda_for_slot(int slot) {
         handle = (int32_t)(dev_id & 0xffffffffu);
         gp_log("slot[%d] using local VDA handle=0x%x for VDI\n",
                slot, (uint32_t)handle);
-        maybe_disconnect_physical_pad_for_slot(slot);
+        if (g_slots[slot].vid == MAMBA_SWITCH_VID &&
+            g_slots[slot].pid == MAMBA_SWITCH_PID) {
+            gp_log("slot[%d] X10: deferring physical-pad sweep until USB is claimed\n",
+                   slot);
+        } else {
+            maybe_disconnect_physical_pad_for_slot(slot);
+        }
     } else if (handle >= 0) {
         gp_log("slot[%d] klog timeout — using direct handle %d\n", slot, handle);
     } else {
@@ -982,13 +1028,50 @@ typedef struct {
     int      slot;
     char     dev_path[32];
     uint16_t vid, pid;
+    int      preopened_fd;
 } usb_thread_arg_t;
+
+/* Several third-party pads impersonate a Switch Pro Controller (057e:2009)
+ * while using a different interrupt-IN endpoint.  Do not select a pad by
+ * VID/PID alone: probe the standard interrupt-IN range after detaching HID.
+ * The first pass is deliberately non-streaming; it only discovers the
+ * endpoint that pass two must claim. */
+static int open_switch_input_endpoint(int fd, int slot, const char *pass,
+                                      struct usb_fs_open *out_open,
+                                      uint8_t *out_ep) {
+    static const uint8_t candidates[] = { 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87 };
+    size_t i;
+    int last_errno = EINVAL;
+
+    for (i = 0; i < sizeof(candidates); i++) {
+        memset(out_open, 0, sizeof(*out_open));
+        out_open->ep_index = 0;
+        out_open->ep_no = candidates[i];
+        out_open->max_bufsize = 64;
+        out_open->max_frames = 1;
+
+        if (ioctl(fd, USB_FS_OPEN, out_open) == 0) {
+            *out_ep = candidates[i];
+            gp_log("slot[%d] Switch %s IN ep=0x%02x maxpkt=%u\n", slot, pass,
+                   *out_ep, (unsigned)out_open->max_packet_length);
+            return 0;
+        }
+
+        last_errno = errno;
+        gp_log("slot[%d] Switch %s IN ep=0x%02x rejected errno=%d\n", slot,
+               pass, candidates[i], last_errno);
+    }
+
+    errno = last_errno;
+    return -1;
+}
 
 static void *usb_hid_thread(void *arg) {
     usb_thread_arg_t *targ = (usb_thread_arg_t *)arg;
     int slot = targ->slot;
     char dev_path[32]; memcpy(dev_path, targ->dev_path, sizeof(dev_path));
     uint16_t vid = targ->vid, pid = targ->pid;
+    int preopened_fd = targ->preopened_fd;
     free(targ);
 
     struct usb_fs_endpoint eps[2];
@@ -1001,7 +1084,11 @@ static void *usb_hid_thread(void *arg) {
     struct usb_fs_uninit   uninit;
     uint8_t  buf[64];
     void    *buffers[1]; uint32_t lengths[1];
-    int fd = -1, out_opened = 0;
+    int fd = preopened_fd, out_opened = 0;
+    int switch_out_try;
+    int x10_raw_log_count = 0;
+    int x10_have_last_raw = 0;
+    uint8_t x10_last_raw[8];
     int usb_ready_notified = 0;
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
@@ -1159,78 +1246,93 @@ static void *usb_hid_thread(void *arg) {
         goto main_loop;
     }
 
-    /* ── Nintendo: two-pass ────────────────────────────────────────────── */
-    fd = open(dev_path, O_RDWR);
+    /* ── Nintendo/Switch HID: two-pass ─────────────────────────────────── */
+    uint8_t switch_in_ep = 0;
+    if (fd >= 0)
+        gp_log("slot[%d] X10 using pre-opened USB fd\n", slot);
+    else
+        fd = open(dev_path, O_RDWR);
     if (fd < 0) { gp_log("slot[%d] open fail errno=%d\n", slot, errno); goto exit_slot; }
     memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
-    init.pEndpoints=eps; init.ep_index_max=1;
+    init.pEndpoints=eps; init.ep_index_max=2;
     if (ioctl(fd,USB_FS_INIT,&init)!=0){
         gp_log("slot[%d] Nintendo FS_INIT p1 fail\n",slot); close(fd); goto exit_slot;
     }
     { int i0=0,i1=1; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i0); ioctl(fd,USB_IFACE_DRIVER_DETACH,&i1); }
-    memset(&fs_open,0,sizeof(fs_open));
-    fs_open.ep_index=0; fs_open.ep_no=0x81; fs_open.max_bufsize=64; fs_open.max_frames=1;
-    if (ioctl(fd,USB_FS_OPEN,&fs_open)!=0){
-        gp_log("slot[%d] Nintendo IN p1 fail errno=%d\n",slot,errno); goto uninit_exit;
+    if (open_switch_input_endpoint(fd, slot, "p1", &fs_open, &switch_in_ep) != 0){
+        gp_log("slot[%d] Switch IN p1: no compatible endpoint errno=%d\n",slot,errno); goto uninit_exit;
     }
-    gp_log("slot[%d] Nintendo p1 IN ok maxpkt=%u\n",slot,(unsigned)fs_open.max_packet_length);
-    memset(&uninit,0,sizeof(uninit)); ioctl(fd,USB_FS_UNINIT,&uninit);
-    close(fd); fd=-1;
-
-    /* Pass 2: retry DETACH+OPEN up to 5 times to beat usb_hid0 re-attach
-     * (real Switch Pro is claimed by PS5 native HID driver after probe releases it) */
-    { int detach_try;
-      for (detach_try = 0; detach_try < 5; detach_try++) {
-        fd = open(dev_path, O_RDWR);
-        if (fd < 0) { gp_log("slot[%d] reopen fail attempt %d\n",slot,detach_try); goto exit_slot; }
-        { int i0=0,i1=1,i2=2;
-          ioctl(fd,USB_IFACE_DRIVER_DETACH,&i0);
-          ioctl(fd,USB_IFACE_DRIVER_DETACH,&i1);
-          ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2); }
-        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
-        init.pEndpoints=eps; init.ep_index_max=2;
-        if (ioctl(fd,USB_FS_INIT,&init)!=0){
-            close(fd); fd=-1; usleep(50000); continue;
-        }
-        memset(&fs_open,0,sizeof(fs_open));
-        fs_open.ep_index=0; fs_open.ep_no=0x81; fs_open.max_bufsize=64; fs_open.max_frames=1;
-        if (ioctl(fd,USB_FS_OPEN,&fs_open)==0) break; /* claimed it */
+    if (switch_in_ep == 0x81) {
         memset(&uninit,0,sizeof(uninit)); ioctl(fd,USB_FS_UNINIT,&uninit);
         close(fd); fd=-1;
-        gp_log("slot[%d] Nintendo p2 OPEN retry %d errno=%d\n",slot,detach_try,errno);
-        usleep(50000);
-      }
-      if (fd < 0) { gp_log("slot[%d] Nintendo p2 give up\n",slot); goto exit_slot; }
+
+        /* Pass 2: retry DETACH+OPEN to beat usb_hid0 re-attach for the
+         * standard Switch Pro endpoint. */
+        { int detach_try;
+          for (detach_try = 0; detach_try < 5; detach_try++) {
+            fd = open(dev_path, O_RDWR);
+            if (fd < 0) { gp_log("slot[%d] reopen fail attempt %d\n",slot,detach_try); goto exit_slot; }
+            { int i0=0,i1=1,i2=2;
+              ioctl(fd,USB_IFACE_DRIVER_DETACH,&i0);
+              ioctl(fd,USB_IFACE_DRIVER_DETACH,&i1);
+              ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2); }
+            memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+            init.pEndpoints=eps; init.ep_index_max=2;
+            if (ioctl(fd,USB_FS_INIT,&init)!=0){
+                close(fd); fd=-1; usleep(50000); continue;
+            }
+            if (open_switch_input_endpoint(fd, slot, "p2", &fs_open, &switch_in_ep) == 0) break; /* claimed it */
+            memset(&uninit,0,sizeof(uninit)); ioctl(fd,USB_FS_UNINIT,&uninit);
+            close(fd); fd=-1;
+            gp_log("slot[%d] Switch p2 OPEN retry %d errno=%d\n",slot,detach_try,errno);
+            usleep(50000);
+          }
+          if (fd < 0) { gp_log("slot[%d] Switch p2 give up\n",slot); goto exit_slot; }
+        }
+    } else {
+        gp_log("slot[%d] Switch nonstandard IN ep=0x%02x retained from p1\n",
+               slot, switch_in_ep);
     }
-    gp_log("slot[%d] Nintendo p2 IN ok maxpkt=%u\n",slot,(unsigned)fs_open.max_packet_length);
+    gp_log("slot[%d] Switch input claimed ep=0x%02x maxpkt=%u\n",slot,
+           switch_in_ep,(unsigned)fs_open.max_packet_length);
     if (fs_open.max_packet_length != 64){ gp_log("slot[%d] wrong maxpkt, reinit\n",slot); goto reinit; }
 
     buffers[0]=buf; lengths[0]=64;
     eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
     eps[0].timeout=200; eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
 
-    /* 8BitDo uses ep=0x02; real Nintendo Switch Pro Controller uses ep=0x01 */
-    memset(&fs_open,0,sizeof(fs_open));
-    fs_open.ep_index=1; fs_open.ep_no=0x02; fs_open.max_bufsize=64; fs_open.max_frames=1;
-    out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
-    if (!out_opened) {
+    /* 8BitDo uses ep=0x02; real Switch uses ep=0x01.  The X10 uses a
+     * nonstandard IN endpoint, so probe the nearby OUT endpoints too. */
+    static const uint8_t switch_out_candidates[] = { 0x02, 0x01, 0x03, 0x04, 0x05 };
+    for (switch_out_try = 0;
+         switch_out_try < (int)sizeof(switch_out_candidates);
+         switch_out_try++) {
         memset(&fs_open,0,sizeof(fs_open));
-        fs_open.ep_index=1; fs_open.ep_no=0x01; fs_open.max_bufsize=64; fs_open.max_frames=1;
+        fs_open.ep_index=1;
+        fs_open.ep_no=switch_out_candidates[switch_out_try];
+        fs_open.max_bufsize=64;
+        fs_open.max_frames=1;
         out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
-        if (out_opened) gp_log("slot[%d] Nintendo OUT ep=0x01 (real Switch Pro)\n", slot);
+        if (out_opened) {
+            gp_log("slot[%d] Switch OUT ep=0x%02x\n", slot, fs_open.ep_no);
+            break;
+        }
     }
-    gp_log("slot[%d] Nintendo OUT opened=%d\n", slot, out_opened);
-    if (out_opened) {
+    gp_log("slot[%d] Switch OUT opened=%d\n", slot, out_opened);
+    if (out_opened && switch_in_ep == 0x81) {
         usb_send_cmd(fd,&eps[1],0x80,0x02); usleep(30000);
         usb_send_cmd(fd,&eps[1],0x80,0x04); usleep(50000);
         gp_log("slot[%d] Nintendo [80 02]+[80 04] sent\n", slot);
+    } else if (out_opened) {
+        gp_log("slot[%d] X10 nonstandard endpoint: skipping Nintendo init commands\n", slot);
     }
 
 main_loop: ;
     int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
     int is_mamba_xinput = mamba_is_xinput_vidpid(vid, pid);
     int is_mamba_switch = mamba_is_switch_vidpid(vid, pid);
-    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput) ? HS_STREAMING : HS_WAIT_81_01;
+    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput ||
+                    switch_in_ep != 0x81) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
@@ -1275,6 +1377,24 @@ main_loop: ;
 
         uint32_t len = lengths[0];
 
+        if (is_mamba_switch && switch_in_ep != 0x81 && x10_raw_log_count < 16) {
+            uint8_t b1 = len > 1 ? buf[1] : 0;
+            uint8_t b2 = len > 2 ? buf[2] : 0;
+            uint8_t b3 = len > 3 ? buf[3] : 0;
+            uint8_t b4 = len > 4 ? buf[4] : 0;
+            uint8_t b5 = len > 5 ? buf[5] : 0;
+            uint8_t b6 = len > 6 ? buf[6] : 0;
+            uint8_t b7 = len > 7 ? buf[7] : 0;
+            uint8_t raw[8] = { buf[0], b1, b2, b3, b4, b5, b6, b7 };
+            if (!x10_have_last_raw || memcmp(raw, x10_last_raw, sizeof(raw)) != 0) {
+                gp_log("slot[%d] X10 raw[%d] len=%u: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                       slot, x10_raw_log_count++, (unsigned)len, buf[0], b1, b2, b3,
+                       b4, b5, b6, b7);
+                memcpy(x10_last_raw, raw, sizeof(raw));
+                x10_have_last_raw = 1;
+            }
+        }
+
         ScePadData pad; memset(&pad,0,sizeof(pad)); pad.quat.w=1.0f;
         int injected = 0;
 
@@ -1287,8 +1407,14 @@ main_loop: ;
         } else {
             if (is_mamba_switch) mamba_log_switch_packet(buf, len);
             injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
-            if (injected > 0 && is_mamba_switch)
+            if (injected > 0 && is_mamba_switch) {
                 pad.leftStick.y = (uint8_t)(255u - pad.leftStick.y);
+                /* The X10's nonstandard 0x84 Switch endpoint reports right-Y
+                 * opposite to the virtual DualSense convention. Standard
+                 * Switch endpoint 0x81 devices retain their existing path. */
+                if (switch_in_ep != 0x81)
+                    pad.rightStick.y = (uint8_t)(255u - pad.rightStick.y);
+            }
         }
 
         if (g_slots[slot].released_pause) {
@@ -1345,9 +1471,19 @@ main_loop: ;
                 g_slots[slot].confirmed = 1;
                 if (g_assign_slot == slot) g_assign_slot = -1;
                 gp_log("slot[%d] assignment confirmed (button press)\n", slot);
+                /* Switch-compatible pads defer physical-pad removal during
+                 * VDA setup because the X10 can lose its ugen node then. The
+                 * USB endpoint is now claimed and the user selected this
+                 * virtual pad, so complete the handoff before a game opens
+                 * the competing physical DualSense. */
+                if (is_mamba_switch) {
+                    gp_log("slot[%d] Switch assignment confirmed; handing off physical controller\n",
+                           slot);
+                    maybe_disconnect_physical_pad_for_slot(slot);
+                }
             }
             inject_pad(slot, &pad);
-            if ((g_slots[slot].inject_count % 600) == 0)
+            if (!is_mamba_switch && (g_slots[slot].inject_count % 600) == 0)
                 maybe_disconnect_physical_pad_for_slot(slot);
         }
     }
@@ -1490,6 +1626,9 @@ static void *controller_manager_thread(void *arg) {
             int32_t handle = create_vda_for_slot(slot);
             if (handle < 0) {
                 gp_log("manager: slot[%d] VDA failed — releasing\n", slot);
+                int stale_x10_fd = x10_take_preopened_fd(path);
+                if (stale_x10_fd >= 0)
+                    close(stale_x10_fd);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].usb_active = 0;
                 g_slots[slot].release_requested = 0;
@@ -1515,6 +1654,9 @@ static void *controller_manager_thread(void *arg) {
             usb_thread_arg_t *targ = malloc(sizeof(*targ));
             if (!targ) {
                 gp_log("manager: malloc fail for slot[%d]\n", slot);
+                int stale_x10_fd = x10_take_preopened_fd(path);
+                if (stale_x10_fd >= 0)
+                    close(stale_x10_fd);
                 scePadVirtualDeviceDeleteDevice(handle);
                 pthread_mutex_lock(&g_slot_lock);
                 g_slots[slot].handle=-1; g_slots[slot].vdi_ready=0;
@@ -1529,10 +1671,14 @@ static void *controller_manager_thread(void *arg) {
             targ->slot = slot;
             strncpy(targ->dev_path, path, sizeof(targ->dev_path)-1);
             targ->vid=vid; targ->pid=pid;
+            targ->preopened_fd = (vid == MAMBA_SWITCH_VID && pid == MAMBA_SWITCH_PID)
+                                    ? x10_take_preopened_fd(path) : -1;
 
             pthread_t tid;
             if (pthread_create(&tid, NULL, usb_hid_thread, targ) != 0) {
                 gp_log("manager: pthread_create fail slot[%d]\n", slot);
+                if (targ->preopened_fd >= 0)
+                    close(targ->preopened_fd);
                 free(targ);
                 scePadVirtualDeviceDeleteDevice(handle);
                 pthread_mutex_lock(&g_slot_lock);
@@ -1623,8 +1769,8 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control by StonedModder - Patch Manba V2 NBJr starting - %d slots\n", MAX_SLOTS);
-    notify("Ghost-Control by StonedModder - Patch Manba V2 NBJr");
+    gp_log("Ghost-Control with EasySMX X10 support starting - %d slots\n", MAX_SLOTS);
+    notify("Ghost-Control: EasySMX X10 support");
 
     /* Kill previous instance */
     { int pfd=open(PID_PATH,O_RDONLY);
