@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here. Release tags use semver (`1.0.x`).
 
-## Unreleased
+## [1.1.0] — 2026-08-07
 
 ### Added
 
