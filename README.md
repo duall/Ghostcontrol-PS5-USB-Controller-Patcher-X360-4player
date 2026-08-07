@@ -7,7 +7,7 @@ If you enjoy my work - please consider donating to my BTC address:
 
 Use third-party USB controllers on PS5. Reads USB HID input from a plugged-in controller and injects it into a virtual DualSense via the PS5's `scePadVirtualDeviceInsertData` path (Ghostpad VDI path).
 
-**Hardware-tested controllers:** 8BitDo Ultimate 2 and EasySMX X10 in Nintendo Switch Pro Controller mode (both report `057e:2009`).
+**Hardware-tested controllers:** 8BitDo Ultimate 2, EasySMX X10 (wired Switch mode and its 2.4G receiver), and the original wired DualShock 4 v1.
 
 ---
 
@@ -43,6 +43,8 @@ https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
 |-----------|------|---------|--------|
 | 8BitDo Ultimate 2 | Nintendo Switch Pro | 057e:2009 | ✅ Working |
 | EasySMX X10 | Switch mode (rear switch) | 057e:2009 | ✅ Working |
+| EasySMX X10 | 2.4G receiver (rear switch) | 045e:028e | ✅ Working |
+| DualShock 4 v1 | Wired USB | 054c:05c4 | ✅ Working |
 | 8BitDo Ultimate 2 | Native | 2dc8:310b | Untested |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | 2dc8:310a | ✅ Working |
 
@@ -54,21 +56,22 @@ See [othercontrollersGuide.md](othercontrollersGuide.md) for adding new controll
 
 ```sh
 export PS5_PAYLOAD_SDK=/path/to/ps5-payload-sdk
+cd payload
 make clean all
 ```
 
-Output: `ghost-control-easysmx-x10.elf`
+Output: `ghost-control-x10-ds4.elf`
 
 ## Deploy
 
 ```sh
 # Deploy to PS5 (replace IP)
-nc -w 5 192.168.1.xxx 9021 < ghost-control-ps5.elf
+nc -w 5 192.168.1.xxx 9021 < payload/ghost-control-x10-ds4.elf
 ```
 
 Or set `PS5_HOST` in your environment:
 ```sh
-make deploy PS5_HOST=192.168.1.xxx
+make -C payload deploy PS5_HOST=192.168.1.xxx
 ```
 
 ---

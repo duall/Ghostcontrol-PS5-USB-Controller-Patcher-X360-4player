@@ -12,6 +12,8 @@ For how to add new devices, see [othercontrollersGuide.md](othercontrollersGuide
 |------------|------|---------|---------------|-------|
 | 8BitDo Ultimate 2 | Nintendo Switch Pro | `057e:2009` | Nintendo / Manba Switch | Original confirmed path; IN `0x81`, 64-byte reports |
 | EasySMX X10 | Switch mode (rear switch) | `057e:2009` | Nintendo parser, nonstandard endpoint path | IN `0x84`, OUT `0x03`, 64-byte reports. The normal Nintendo init commands are skipped; a USB descriptor FD is held through virtual-pad assignment to avoid a PS5 `/dev/ugen` timing race. Right-stick Y is normalized for the virtual DualSense. After X10 assignment is confirmed, Ghostcontrol releases the competing physical DualSense for that user. |
+| EasySMX X10 | 2.4G receiver (rear switch) | `045e:028e` | XInput / Manba XUSB | Verified with the supplied receiver: IN `0x82`, OUT `0x02`, 20-byte XInput reports. The receiver's existing radio pairing is retained; Ghostcontrol does not send the Manba-specific enable packet. |
+| DualShock 4 v1 | Direct wired USB | `054c:05c4` | DS4 USB parser | Verified official v1 only: IN `0x84`, OUT `0x03`, 64-byte report `0x01`. Includes a one-time connection-confirmation rumble after input streaming begins. Bluetooth, the Sony wireless adaptor, DS4 v2, and third-party DS4-layout pads are outside this tested scope. |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | `2dc8:310a` | Manba XUSB (reuse) | Composite device: IN `0x84`, OUT `0x05` (not classic `0x81`/`0x01`). USB-C cable and 2.4G dongle. Merged in [#19](https://github.com/StonedModder/Ghostcontrol-PS5-USB-Controller-Patcher/pull/19). |
 
 ---
@@ -43,9 +45,9 @@ For how to add new devices, see [othercontrollersGuide.md](othercontrollersGuide
 
 ---
 
-## XInput endpoint selection (8BitDo 2C and Manba)
+## XInput endpoint selection (EasySMX X10, 8BitDo 2C, and Manba)
 
-Classic Manba XInput uses IN `0x81` and OUT `0x02` (fallback `0x01`). The 8BitDo Ultimate 2C Wireless uses IN `0x84` and OUT `0x05` because it is a **composite** device (XInput + HID keyboard/mouse). `probe_one_path()` matches `2dc8:310a` **before** the generic XInput interface normalizes to `045e:028e`, so the correct endpoints are opened in `usb_hid_thread()`.
+Classic Manba XInput uses IN `0x81` and OUT `0x02` (fallback `0x01`). The EasySMX X10 receiver presents as `045e:028e` but uses IN `0x82`, OUT `0x02`; that profile is verified by hardware and skips the Manba-only enable command. The 8BitDo Ultimate 2C Wireless uses IN `0x84` and OUT `0x05` because it is a **composite** device (XInput + HID keyboard/mouse). `probe_one_path()` matches `2dc8:310a` **before** the generic XInput interface normalizes to `045e:028e`, so the correct endpoints are opened in `usb_hid_thread()`.
 
 ---
 
@@ -54,4 +56,5 @@ Classic Manba XInput uses IN `0x81` and OUT `0x02` (fallback `0x01`). The 8BitDo
 - `payload/gc_main.c` — scan, probe, USB threads
 - `payload/controller_mamba.h` / `controller_mamba.c` — Manba + shared XUSB parser
 - `payload/controller_nintendo.c` — Switch Pro protocol
+- `payload/controller_ds4.c` — wired DualShock 4 input parser
 - `README.md` — quick reference table

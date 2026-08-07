@@ -7,6 +7,8 @@ All notable changes to this project are documented here. Release tags use semver
 ### Added
 
 - **EasySMX X10** hardware-tested support in Switch mode (`057e:2009`): nonstandard USB endpoints IN `0x84` / OUT `0x03`, using the existing Nintendo report parser.
+- **EasySMX X10 2.4G receiver** hardware-tested support in XInput mode (`045e:028e`): IN `0x82`, OUT `0x02`, and the existing 20-byte XInput parser.
+- **Official wired DualShock 4 v1** hardware-tested support (`054c:05c4`): 64-byte USB report `0x01`, IN `0x84`, OUT `0x03`, and a one-time connection-confirmation rumble.
 
 ### Fixed
 
@@ -14,6 +16,11 @@ All notable changes to this project are documented here. Release tags use semver
 - Skip standard Nintendo initialization commands for the X10, which otherwise reset the controller.
 - Complete the delayed physical-controller handoff after X10 assignment is confirmed, so games use the virtual controller instead of a concurrently connected DualSense.
 - Normalize the X10's right-stick vertical axis for the virtual DualSense.
+- Skip the Manba-only XInput enable packet for the X10 receiver, which is already active after its own radio pairing.
+
+### Scope
+
+- DS4 support is intentionally limited to the verified original wired v1 controller. Bluetooth, the Sony wireless adaptor, DS4 v2, and third-party DS4-layout devices remain untested and unsupported.
 
 ## [1.0.5] — 2026-07-05
 
