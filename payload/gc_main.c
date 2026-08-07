@@ -1310,6 +1310,24 @@ static void x10_connection_pulse(int fd, struct usb_fs_endpoint *out_ep, int slo
     gp_log("slot[%d] X10 ready rumble start=%d stop=%d\n", slot, start_ret, stop_ret);
 }
 
+/* DualShock 4 USB output report 0x05 is 32 bytes.  Byte 1 enables motor
+ * output; bytes 4 and 5 are respectively the small/right and large/left
+ * motor strengths.  Keep this deliberately limited to the verified official
+ * wired DS4 v1 profile rather than assuming third-party Sony-layout devices
+ * accept the same output report. */
+static void ds4_connection_pulse(int fd, struct usb_fs_endpoint *out_ep, int slot) {
+    static const uint8_t rumble[32] = {
+        0x05, 0x01, 0x00, 0x00, 0x60, 0xa0
+    };
+    static const uint8_t stop[32] = {
+        0x05, 0x01, 0x00, 0x00, 0x00, 0x00
+    };
+    int start_ret = usb_send_out(fd, out_ep, rumble, sizeof(rumble), "ds4-ready");
+    usleep(180000);
+    int stop_ret = usb_send_out(fd, out_ep, stop, sizeof(stop), "ds4-stop");
+    gp_log("slot[%d] DS4 ready rumble start=%d stop=%d\n", slot, start_ret, stop_ret);
+}
+
 static void *usb_hid_thread(void *arg) {
     usb_thread_arg_t *targ = (usb_thread_arg_t *)arg;
     int slot = targ->slot;
@@ -1600,6 +1618,7 @@ main_loop: ;
     uint8_t nintendo_seq = 1;
     int x10_ready_pulse_pending = (is_mamba_switch && switch_in_ep == 0x84 &&
                                    switch_out_ep == 0x03 && out_opened);
+    int ds4_ready_pulse_pending = is_official_wired_ds4_v1(vid, pid) && out_opened;
     g_slots[slot].usb_fd = fd;  /* register fd for clean teardown on SIGTERM */
 
     while (!g_shutdown_requested) {
@@ -1730,6 +1749,10 @@ main_loop: ;
             if (x10_ready_pulse_pending) {
                 x10_ready_pulse_pending = 0;
                 x10_connection_pulse(fd, &eps[1], slot);
+            }
+            if (ds4_ready_pulse_pending) {
+                ds4_ready_pulse_pending = 0;
+                ds4_connection_pulse(fd, &eps[1], slot);
             }
             if (!usb_ready_notified) {
                 notify("Ghost-Control by StonedModder: slot[%d] streaming - controller active", slot);
