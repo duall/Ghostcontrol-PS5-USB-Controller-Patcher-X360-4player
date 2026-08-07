@@ -476,15 +476,30 @@ static void inject_pad(int slot, const ScePadData *pad) {
 
 /* Path list is now built dynamically per scan from /dev — see manager loop. */
 
+/* Keep this first DS4 pass tightly scoped to the original, wired DualShock 4.
+ * Do not wildcard Sony, enable DS4 v2, third-party pads, or Bluetooth here. */
+static int is_official_wired_ds4_v1(uint16_t vid, uint16_t pid) {
+    return vid == VID_SONY && pid == PID_DS4_V1;
+}
+
+static int is_supported_controller(uint16_t vid, uint16_t pid) {
+    return mamba_is_supported_vidpid(vid, pid) ||
+           is_official_wired_ds4_v1(vid, pid);
+}
+
+static const char *controller_name(uint16_t vid, uint16_t pid) {
+    return is_official_wired_ds4_v1(vid, pid) ? "DualShock 4 v1 (wired)" :
+                                                mamba_name(vid, pid);
+}
+
 /* Match a (vid,pid) against our supported controller table.
- * Returns 1 if recognized — fills out_vid/out_pid even if PID is unknown
- * (so DS4-family clones with novel PIDs still hit the DS4 path).
+ * Returns 1 if recognized and preserves its actual VID/PID for the USB path.
  * NOTE: Xbox is NOT matched here — it is detected by GIP interface protocol
  * in probe_one_path (covers all Xbox One/Series PIDs, rejects non-controller
  * Microsoft USB devices). */
 static int match_known_vidpid(uint16_t vid, uint16_t pid,
                               uint16_t *out_vid, uint16_t *out_pid) {
-    if (mamba_is_supported_vidpid(vid, pid)) {
+    if (is_supported_controller(vid, pid)) {
         *out_vid = vid; *out_pid = pid;
         return 1;
     }
@@ -639,7 +654,7 @@ static int any_mamba_slot_active(void) {
         if (g_slots[s].usb_active &&
             g_slots[s].vdi_ready &&
             !g_slots[s].released_pause &&
-            mamba_is_supported_vidpid(g_slots[s].vid, g_slots[s].pid)) {
+            is_supported_controller(g_slots[s].vid, g_slots[s].pid)) {
             active = 1;
             break;
         }
@@ -711,7 +726,7 @@ static int active_evicted_mamba_slot_snapshot(int *out_slot, uint64_t *out_vdev,
     pthread_mutex_lock(&g_slot_lock);
     for (int s = 0; s < MAX_SLOTS; s++) {
         if (g_slots[s].usb_active &&
-            mamba_is_supported_vidpid(g_slots[s].vid, g_slots[s].pid) &&
+            is_supported_controller(g_slots[s].vid, g_slots[s].pid) &&
             g_slots[s].virtual_dev_id &&
             g_slots[s].physical_evict_done) {
             if (out_slot) *out_slot = s;
@@ -1045,14 +1060,14 @@ done:
 static int32_t create_vda_for_slot(int slot) {
     struct { int32_t size; int32_t userId; int32_t pad[6]; } vdp;
     const int32_t SEN = (int32_t)0xDEADBEEFu;
-    int is_mamba = mamba_is_supported_vidpid(g_slots[slot].vid, g_slots[slot].pid);
+    int is_supported = is_supported_controller(g_slots[slot].vid, g_slots[slot].pid);
 
     memset(&vdp,0,sizeof(vdp)); vdp.size=sizeof(vdp); vdp.userId=1;
     for(int k=0;k<6;k++) vdp.pad[k]=SEN;
 
-    if (is_mamba) {
-        gp_log("slot[%d] Manba V2 NBJr VDA create for %s\n",
-               slot, mamba_name(g_slots[slot].vid, g_slots[slot].pid));
+    if (is_supported) {
+        gp_log("slot[%d] VDA create for %s\n", slot,
+               controller_name(g_slots[slot].vid, g_slots[slot].pid));
     }
     int ret = scePadVirtualDeviceAddDevice(&vdp, VIRTUAL_DEVICE_TYPE_DUALSENSE);
     gp_log("slot[%d] VDA ret=0x%08x\n", slot, (uint32_t)ret);
@@ -1835,7 +1850,7 @@ static void *controller_manager_thread(void *arg) {
             uint16_t vid=0, pid=0;
             if (!probe_one_path(path, &vid, &pid)) continue;
 
-            if (mamba_is_supported_vidpid(vid, pid) && any_mamba_slot_active()) {
+            if (is_supported_controller(vid, pid) && any_mamba_slot_active()) {
                 if ((scan % 5) == 0)
                     gp_log("manager: %s ignored because another Manba slot is active\n", path);
                 if (vid == MAMBA_SWITCH_VID && pid == MAMBA_SWITCH_PID)
@@ -1881,9 +1896,8 @@ static void *controller_manager_thread(void *arg) {
                 continue;
             }
 
-            const char *name =
-                mamba_is_supported_vidpid(vid,pid) ? mamba_name(vid,pid) :
-                                                     "Unknown";
+            const char *name = is_supported_controller(vid, pid) ?
+                controller_name(vid, pid) : "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
             notify("Ghost-Control by StonedModder: %s detected - assign user on screen", name);
@@ -2072,9 +2086,9 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control EasySMX X10 wired + wireless candidate #1 starting - %d slots\n",
+    gp_log("Ghost-Control EasySMX X10 + wired DS4 v1 candidate starting - %d slots\n",
            MAX_SLOTS);
-    notify("Ghost-Control: X10 wired + wireless candidate #1");
+    notify("Ghost-Control: X10 + wired DS4 v1 candidate");
 
     wait_for_previous_instance();
     { int pfd=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
