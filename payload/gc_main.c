@@ -1320,6 +1320,7 @@ static void *usb_hid_thread(void *arg) {
     int x10_raw_log_count = 0;
     int x10_have_last_raw = 0;
     uint8_t x10_last_raw[8];
+    uint8_t xinput_in_ep = 0;
     int usb_ready_notified = 0;
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
@@ -1395,23 +1396,25 @@ static void *usb_hid_thread(void *arg) {
         }
 
         /* Endpoint layout differs per device: classic Manba is IN=0x81/OUT=0x02,
-         * but the composite 8BitDo 2C uses IN=0x84/OUT=0x05 (real config
-         * descriptor). Try the device-specific endpoints first, then the other
-         * variant, so both work even across cable/dongle differences. */
+         * the EasySMX X10 2.4 GHz receiver is IN=0x82/OUT=0x02, and the
+         * composite 8BitDo 2C uses IN=0x84/OUT=0x05. The X10 topology and
+         * 20-byte 00 14 report layout were captured on PS5 hardware. */
         int is_8bitdo = (vid == GC8BITDO_2C_XINPUT_VID && pid == GC8BITDO_2C_XINPUT_PID);
-        uint8_t in_cands[2]  = { is_8bitdo ? GC8BITDO_2C_XINPUT_EP_IN : MAMBA_XINPUT_EP_IN,
-                                 is_8bitdo ? MAMBA_XINPUT_EP_IN       : GC8BITDO_2C_XINPUT_EP_IN };
+        uint8_t in_cands[3]  = { is_8bitdo ? GC8BITDO_2C_XINPUT_EP_IN : MAMBA_XINPUT_EP_IN,
+                                 is_8bitdo ? MAMBA_XINPUT_EP_IN       : 0x82u,
+                                 is_8bitdo ? 0x82u                    : GC8BITDO_2C_XINPUT_EP_IN };
         uint8_t out_cands[3] = { is_8bitdo ? GC8BITDO_2C_XINPUT_EP_OUT : MAMBA_XINPUT_EP_OUT,
                                  MAMBA_XINPUT_EP_OUT_ALT,
                                  is_8bitdo ? MAMBA_XINPUT_EP_OUT       : GC8BITDO_2C_XINPUT_EP_OUT };
 
         int in_ok = 0;
-        for (int c = 0; c < 2 && !in_ok; c++) {
+        for (int c = 0; c < 3 && !in_ok; c++) {
             memset(&fs_open,0,sizeof(fs_open));
             fs_open.ep_index=0; fs_open.ep_no=in_cands[c];
             fs_open.max_bufsize=64; fs_open.max_frames=1;
             if (ioctl(fd,USB_FS_OPEN,&fs_open)==0) {
                 in_ok = 1;
+                xinput_in_ep = in_cands[c];
                 gp_log("slot[%d] XInput IN ep=0x%02x ok maxpkt=%u\n",
                        slot, in_cands[c], (unsigned)fs_open.max_packet_length);
             }
@@ -1435,7 +1438,13 @@ static void *usb_hid_thread(void *arg) {
             }
         }
         gp_log("slot[%d] XInput OUT opened=%d\n", slot, out_opened);
-        if (out_opened) mamba_xinput_send_enable(fd, eps);
+        if (out_opened && xinput_in_ep == 0x82u) {
+            /* The X10 receiver already streams immediately after its own
+             * radio pairing. Do not send the Manba-specific enable packet. */
+            gp_log("slot[%d] X10 wireless XInput endpoint profile: skipping Manba enable\n", slot);
+        } else if (out_opened) {
+            mamba_xinput_send_enable(fd, eps);
+        }
         goto main_loop;
     }
 
@@ -2063,8 +2072,9 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control EasySMX X10 handoff-stability v2 starting - %d slots\n", MAX_SLOTS);
-    notify("Ghost-Control: X10 handoff-stability v2");
+    gp_log("Ghost-Control EasySMX X10 wired + wireless candidate #1 starting - %d slots\n",
+           MAX_SLOTS);
+    notify("Ghost-Control: X10 wired + wireless candidate #1");
 
     wait_for_previous_instance();
     { int pfd=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
