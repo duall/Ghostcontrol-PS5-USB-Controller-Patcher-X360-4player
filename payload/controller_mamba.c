@@ -7,6 +7,10 @@
 #define XINPUT_REPORT_LEN 0x14u
 #define DEADZONE          7849
 
+#ifndef GC_SWITCH_CONTROLLER_NAME
+#define GC_SWITCH_CONTROLLER_NAME "Manba V2 NBJr Switch USB mode"
+#endif
+
 int mamba_is_xinput_vidpid(uint16_t vid, uint16_t pid) {
     return (vid == MAMBA_XINPUT_VID && pid == MAMBA_XINPUT_PID) ||
            (vid == GC8BITDO_2C_XINPUT_VID && pid == GC8BITDO_2C_XINPUT_PID);
@@ -33,7 +37,7 @@ const char *mamba_name(uint16_t vid, uint16_t pid) {
     if (mamba_is_xinput_vidpid(vid, pid))
         return "Manba V2 NBJr PC/XInput mode";
     if (mamba_is_switch_vidpid(vid, pid))
-        return "Manba V2 NBJr Switch USB mode";
+        return GC_SWITCH_CONTROLLER_NAME;
     return "Unknown";
 }
 

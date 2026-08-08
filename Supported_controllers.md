@@ -14,6 +14,12 @@ For how to add new devices, see [othercontrollersGuide.md](othercontrollersGuide
 | EasySMX X10 | Switch mode (rear switch) | `057e:2009` | Nintendo parser, nonstandard endpoint path | IN `0x84`, OUT `0x03`, 64-byte reports. The normal Nintendo init commands are skipped; a USB descriptor FD is held through virtual-pad assignment to avoid a PS5 `/dev/ugen` timing race. Right-stick Y is normalized for the virtual DualSense. After X10 assignment is confirmed, Ghostcontrol releases the competing physical DualSense for that user. |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | `2dc8:310a` | Manba XUSB (reuse) | Composite device: IN `0x84`, OUT `0x05` (not classic `0x81`/`0x01`). USB-C cable and 2.4G dongle. Merged in [#19](https://github.com/StonedModder/Ghostcontrol-PS5-USB-Controller-Patcher/pull/19). |
 
+## Protocol confirmed, PS5 gameplay test pending
+
+| Controller | Mode | VID:PID | Parser / path | Notes |
+|------------|------|---------|---------------|-------|
+| 8BitDo Arcade Stick | 2.4G dongle, Switch mode | `057e:2009` | Nintendo standard Switch | Hardware capture confirmed HID IN `0x81`, OUT `0x02`, 64-byte `0x30` reports, all standard directions, face buttons, shoulders/triggers, Create, Options, and Home. The dedicated Switch-mode ELF is ready; PS5 assignment, gameplay, and reconnect testing remain required. |
+
 ---
 
 ## Documented / untested on PS5

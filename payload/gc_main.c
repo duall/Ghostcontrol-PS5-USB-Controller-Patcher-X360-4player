@@ -53,6 +53,10 @@
 #define PID_PATH "/data/ghostpad/gc_main.pid"
 #define LOG_MAX  480
 
+#ifndef GC_BUILD_LABEL
+#define GC_BUILD_LABEL "EasySMX X10 support"
+#endif
+
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_log_fd = -1;
 
@@ -964,7 +968,7 @@ static int32_t create_vda_for_slot(int slot) {
     for(int k=0;k<6;k++) vdp.pad[k]=SEN;
 
     if (is_mamba) {
-        gp_log("slot[%d] Manba V2 NBJr VDA create for %s\n",
+        gp_log("slot[%d] Switch-compatible VDA create for %s\n",
                slot, mamba_name(g_slots[slot].vid, g_slots[slot].pid));
     }
     int ret = scePadVirtualDeviceAddDevice(&vdp, VIRTUAL_DEVICE_TYPE_DUALSENSE);
@@ -1769,8 +1773,8 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control with EasySMX X10 support starting - %d slots\n", MAX_SLOTS);
-    notify("Ghost-Control: EasySMX X10 support");
+    gp_log("Ghost-Control with %s starting - %d slots\n", GC_BUILD_LABEL, MAX_SLOTS);
+    notify("Ghost-Control: %s", GC_BUILD_LABEL);
 
     /* Kill previous instance */
     { int pfd=open(PID_PATH,O_RDONLY);
