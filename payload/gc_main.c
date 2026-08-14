@@ -46,6 +46,7 @@
 #include "controller_xbox.h"
 #include "controller_ds4.h"
 #include "controller_mamba.h"
+#include "controller_x360w.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -119,17 +120,17 @@ static void write_handoff_ack(void) {
 /* A replacement payload must not touch /dev/ugen until the old payload has
  * released USB_FS.  The acknowledgement is used by new builds; liveness is
  * retained as a safe fallback when replacing an older payload. */
-static void wait_for_previous_instance(void) {
+static int wait_for_previous_instance(void) {
     char buf[24] = {0};
     int fd = open(PID_PATH, O_RDONLY);
     if (fd < 0)
-        return;
+        return 0;
     read(fd, buf, sizeof(buf) - 1);
     close(fd);
 
     pid_t old = (pid_t)atoi(buf);
     if (old <= 0 || old == getpid())
-        return;
+        return 0;
 
     unlink(HANDOFF_PATH); /* never accept an acknowledgement from an older run */
     gp_log("handoff: requesting shutdown from pid=%d\n", old);
@@ -149,12 +150,15 @@ static void wait_for_previous_instance(void) {
         }
         usleep(100000);
     }
-    if (!acknowledged && pid_is_alive(old))
-        gp_log("handoff: pid=%d did not exit in time; continuing cautiously\n", old);
+    if (!acknowledged && pid_is_alive(old)) {
+        gp_log("handoff: pid=%d did not exit in time; aborting replacement\n", old);
+        return -1;
+    }
 
     /* The X10 can re-enumerate after USB_FS ownership changes.  Give it a
      * quiet interval before discovery; the warm-up gate below verifies it. */
     g_usb_settle_until_ms = uptime_ms() + 1500;
+    return 0;
 }
 
 /* ── SCE stubs ────────────────────────────────────────────────────────── */
@@ -448,15 +452,16 @@ static void *klog_capture_thread(void *arg) {
 }
 
 /* ── VDI injection ────────────────────────────────────────────────────── */
-static void inject_pad(int slot, const ScePadData *pad) {
+static int inject_pad(int slot, const ScePadData *pad) {
     int32_t h = g_slots[slot].handle;
-    if (h < 0 || !g_slots[slot].vdi_ready) return;
+    if (h < 0 || !g_slots[slot].vdi_ready) return -1;
     int vr = scePadVirtualDeviceInsertData(h, pad);
     uint32_t n = ++g_slots[slot].inject_count;
     if ((n % 600) == 0)
         gp_log("slot[%d] VDI #%u ret=0x%08x\n", slot, n, (uint32_t)vr);
     static int vdi_err_logged = 0;
     if (vr != 0 && !vdi_err_logged) { gp_log("VDI error 0x%08x\n",(uint32_t)vr); vdi_err_logged=1; }
+    return vr;
 }
 
 /* ── ugen detection ───────────────────────────────────────────────────── */
@@ -484,12 +489,16 @@ static int is_official_wired_ds4_v1(uint16_t vid, uint16_t pid) {
 
 static int is_supported_controller(uint16_t vid, uint16_t pid) {
     return mamba_is_supported_vidpid(vid, pid) ||
-           is_official_wired_ds4_v1(vid, pid);
+           is_official_wired_ds4_v1(vid, pid) ||
+           x360w_is_supported_vidpid(vid, pid);
 }
 
 static const char *controller_name(uint16_t vid, uint16_t pid) {
-    return is_official_wired_ds4_v1(vid, pid) ? "DualShock 4 v1 (wired)" :
-                                                mamba_name(vid, pid);
+    if (is_official_wired_ds4_v1(vid, pid))
+        return "DualShock 4 v1 (wired)";
+    if (x360w_is_supported_vidpid(vid, pid))
+        return x360w_name();
+    return mamba_name(vid, pid);
 }
 
 /* Match a (vid,pid) against our supported controller table.
@@ -1354,6 +1363,18 @@ static void *usb_hid_thread(void *arg) {
     int x10_have_last_raw = 0;
     uint8_t x10_last_raw[8];
     uint8_t xinput_in_ep = 0;
+    int xinput_diag_enabled = 0;
+    uint32_t xinput_diag_total = 0;
+    uint32_t xinput_diag_valid = 0;
+    uint32_t xinput_diag_rejected = 0;
+    uint32_t xinput_diag_changes = 0;
+    uint32_t xinput_diag_reject_logs = 0;
+    int xinput_diag_have_last = 0;
+    uint8_t xinput_diag_last[14];
+    x360w_state_t x360w_state;
+    uint64_t x360w_last_input_ms = 0;
+    uint32_t x360w_gap_log_count = 0;
+    int x360w_input_pending = 0;
     int usb_ready_notified = 0;
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
@@ -1478,6 +1499,67 @@ static void *usb_hid_thread(void *arg) {
         } else if (out_opened) {
             mamba_xinput_send_enable(fd, eps);
         }
+        /* This R&D build observes only the direct 045e:028e / IN 0x81
+         * profile reported by the Xbox tester.  X10 wireless uses IN 0x82,
+         * so it retains its normal path without this extra telemetry. */
+        if (vid == MAMBA_XINPUT_VID && pid == MAMBA_XINPUT_PID &&
+            xinput_in_ep == 0x81u) {
+            xinput_diag_enabled = 1;
+            gp_log("slot[%d] XInput R&D #1 active: direct 045e:028e IN=0x81; "
+                   "logging state changes and non-00/14 packets\n", slot);
+        }
+        goto main_loop;
+    }
+
+    /* ── Xbox 360 Wireless Receiver: exact 045e:0291 profile ─────────── */
+    if (x360w_is_supported_vidpid(vid, pid)) {
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { gp_log("slot[%d] Xbox 360 receiver open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        { int ii; for (ii = 0; ii < 4; ii++) { int i2 = ii; ioctl(fd, USB_IFACE_DRIVER_DETACH, &i2); } }
+        usleep(120000);
+        memset(eps, 0, sizeof(eps)); memset(&init, 0, sizeof(init));
+        init.pEndpoints = eps; init.ep_index_max = 2;
+        if (ioctl(fd, USB_FS_INIT, &init) != 0) {
+            gp_log("slot[%d] Xbox 360 receiver FS_INIT fail errno=%d\n", slot, errno);
+            close(fd); goto exit_slot;
+        }
+
+        memset(&fs_open, 0, sizeof(fs_open));
+        fs_open.ep_index = 0; fs_open.ep_no = X360W_EP_IN;
+        fs_open.max_bufsize = 64; fs_open.max_frames = 1;
+        if (ioctl(fd, USB_FS_OPEN, &fs_open) != 0) {
+            gp_log("slot[%d] Xbox 360 receiver IN 0x%02x fail errno=%d\n",
+                   slot, X360W_EP_IN, errno);
+            goto uninit_exit;
+        }
+        gp_log("slot[%d] Xbox 360 receiver IN ep=0x%02x maxpkt=%u\n",
+               slot, X360W_EP_IN, (unsigned)fs_open.max_packet_length);
+
+        buffers[0] = buf; lengths[0] = 64;
+        eps[0].ppBuffer = buffers; eps[0].pLength = lengths; eps[0].nFrames = 1;
+        eps[0].timeout = 50; eps[0].flags = USB_FS_FLAG_SINGLE_SHORT_OK | USB_FS_FLAG_MULTI_SHORT_OK;
+
+        memset(&fs_open, 0, sizeof(fs_open));
+        fs_open.ep_index = 1; fs_open.ep_no = X360W_EP_OUT;
+        fs_open.max_bufsize = 64; fs_open.max_frames = 1;
+        out_opened = (ioctl(fd, USB_FS_OPEN, &fs_open) == 0) ? 1 : 0;
+        gp_log("slot[%d] Xbox 360 receiver OUT ep=0x%02x opened=%d\n",
+               slot, X360W_EP_OUT, out_opened);
+        if (!out_opened)
+            goto reinit;
+
+        x360w_state_init(&x360w_state);
+        if (x360w_send_presence_inquiry(fd, &eps[1]) != 0) {
+            gp_log("slot[%d] X360W presence inquiry failed; refusing unsafe session\n", slot);
+            goto reinit;
+        }
+        memset(&fs_close, 0, sizeof(fs_close));
+        fs_close.ep_index = 1;
+        ioctl(fd, USB_FS_CLOSE, &fs_close);
+        out_opened = 0;
+        gp_log("slot[%d] X360W presence complete; OUT closed, persistent IN will arm\n", slot);
+        notify("Ghost-Control: Xbox 360 receiver ready - pair then press a button");
         goto main_loop;
     }
 
@@ -1612,8 +1694,9 @@ main_loop: ;
     int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
     int is_mamba_xinput = mamba_is_xinput_vidpid(vid, pid);
     int is_mamba_switch = mamba_is_switch_vidpid(vid, pid);
+    int is_x360w = x360w_is_supported_vidpid(vid, pid);
     int is_x10_profile = (switch_in_ep == 0x84 && switch_out_ep == 0x03);
-    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput ||
+    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput || is_x360w ||
                     is_x10_profile) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     int x10_ready_pulse_pending = (is_mamba_switch && switch_in_ep == 0x84 &&
@@ -1627,40 +1710,121 @@ main_loop: ;
             release_mamba_vda_only(slot, "official same user reclaim");
         }
 
-        memset(buf,0,64);
-        buffers[0]=buf; lengths[0]=64;
-        eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
-        eps[0].aFrames=0; eps[0].status=0;
-
-        memset(&start,0,sizeof(start)); start.ep_index=0;
-        if (ioctl(fd,USB_FS_START,&start)!=0) {
-            if (errno==EBUSY){
-                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-                usleep(5000);
-            } else if (errno==ENXIO||errno==ENOTTY){
-                gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
-            } else {
-                gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+        uint32_t len = 0;
+        if (is_x360w) {
+            /* Do not cancel an idle 360-receiver read. Its reports are edges,
+             * so stopping and restarting here would create loss windows. */
+            if (!x360w_input_pending) {
+                memset(buf, 0, sizeof(buf));
+                buffers[0] = buf; lengths[0] = sizeof(buf);
+                eps[0].ppBuffer = buffers; eps[0].pLength = lengths;
+                eps[0].aFrames = 0; eps[0].status = 0;
+                memset(&start, 0, sizeof(start)); start.ep_index = 0;
+                if (ioctl(fd, USB_FS_START, &start) != 0) {
+                    gp_log("slot[%d] X360W IN re-arm errno=%d\n", slot, errno);
+                    goto reinit;
+                }
+                x360w_input_pending = 1;
+                if (x360w_state.input_count == 0)
+                    gp_log("slot[%d] X360W persistent IN armed after presence query\n", slot);
             }
-            continue;
+
+            memset(&complete, 0, sizeof(complete));
+            complete.ep_index = 0;
+            if (ioctl(fd, USB_FS_COMPLETE, &complete) != 0) {
+                int cerr = errno;
+                if (cerr == EBUSY) {
+                    usleep(1000);
+                    continue;
+                }
+                if (cerr == ENXIO || cerr == ENOTTY)
+                    gp_log("slot[%d] X360W IN complete errno=%d — device gone\n", slot, cerr);
+                else
+                    gp_log("slot[%d] X360W IN complete fatal errno=%d\n", slot, cerr);
+                goto reinit;
+            }
+            x360w_input_pending = 0;
+            if (lengths[0] < 1) continue;
+            len = lengths[0];
+        } else {
+            memset(buf,0,64);
+            buffers[0]=buf; lengths[0]=64;
+            eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
+            eps[0].aFrames=0; eps[0].status=0;
+
+            memset(&start,0,sizeof(start)); start.ep_index=0;
+            if (ioctl(fd,USB_FS_START,&start)!=0) {
+                if (errno==EBUSY){
+                    memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                    usleep(5000);
+                } else if (errno==ENXIO||errno==ENOTTY){
+                    gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
+                } else {
+                    gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+                }
+                continue;
+            }
+
+            int ok=0, cerr=0, cw=0;
+            for(cw=0;cw<60;cw++){
+                memset(&complete,0,sizeof(complete)); complete.ep_index=0;
+                if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
+                cerr=errno;
+                if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
+                if(cerr!=EBUSY) break;
+                usleep(500);
+            }
+            if(!ok){
+                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                continue;
+            }
+            if(lengths[0]<1) continue;
+            len = lengths[0];
         }
 
-        int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<60;cw++){
-            memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
-            cerr=errno;
-            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
-            if(cerr!=EBUSY) break;
-            usleep(500);
+        if (xinput_diag_enabled) {
+            int valid_xinput = len >= 14 && buf[0] == 0x00u && buf[1] == 0x14u;
+            xinput_diag_total++;
+            if (valid_xinput) {
+                xinput_diag_valid++;
+                if (!xinput_diag_have_last ||
+                    memcmp(buf, xinput_diag_last, sizeof(xinput_diag_last)) != 0) {
+                    if (xinput_diag_changes < 200) {
+                        gp_log("slot[%d] XInput R&D state[%u] len=%u: "
+                               "%02x %02x %02x %02x %02x %02x %02x %02x "
+                               "%02x %02x %02x %02x %02x %02x\n",
+                               slot, (unsigned)xinput_diag_changes, (unsigned)len,
+                               buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                               buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                               buf[12], buf[13]);
+                    }
+                    xinput_diag_changes++;
+                    memcpy(xinput_diag_last, buf, sizeof(xinput_diag_last));
+                    xinput_diag_have_last = 1;
+                }
+            } else {
+                xinput_diag_rejected++;
+                if (xinput_diag_reject_logs < 80) {
+                    uint8_t b1 = len > 1 ? buf[1] : 0;
+                    uint8_t b2 = len > 2 ? buf[2] : 0;
+                    uint8_t b3 = len > 3 ? buf[3] : 0;
+                    uint8_t b4 = len > 4 ? buf[4] : 0;
+                    uint8_t b5 = len > 5 ? buf[5] : 0;
+                    uint8_t b6 = len > 6 ? buf[6] : 0;
+                    uint8_t b7 = len > 7 ? buf[7] : 0;
+                    gp_log("slot[%d] XInput R&D rejected[%u] len=%u: "
+                           "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           slot, (unsigned)xinput_diag_reject_logs++, (unsigned)len,
+                           buf[0], b1, b2, b3, b4, b5, b6, b7);
+                }
+            }
+            if ((xinput_diag_total % 600u) == 0u) {
+                gp_log("slot[%d] XInput R&D stats total=%u valid=%u rejected=%u "
+                       "state_changes=%u\n", slot, (unsigned)xinput_diag_total,
+                       (unsigned)xinput_diag_valid, (unsigned)xinput_diag_rejected,
+                       (unsigned)xinput_diag_changes);
+            }
         }
-        if(!ok){
-            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-            continue;
-        }
-        if(lengths[0]<1) continue;
-
-        uint32_t len = lengths[0];
 
         if (is_x10_profile && x10_raw_log_count < 16) {
             uint8_t b1 = len > 1 ? buf[1] : 0;
@@ -1687,6 +1851,29 @@ main_loop: ;
             injected = ds4_handle_packet(fd, eps, buf, len, &pad);
         } else if (is_mamba_xinput) {
             injected = mamba_xinput_handle_packet(fd, eps, buf, len, &pad);
+        } else if (is_x360w) {
+            uint32_t prior_input_count = x360w_state.input_count;
+            injected = x360w_handle_packet(buf, len, &x360w_state, &pad);
+            if (x360w_state.presence_changed) {
+                if (x360w_state.controller_present > 0) {
+                    notify("Ghost-Control: Xbox 360 controller paired - press a button to assign");
+                } else {
+                    notify("Ghost-Control: Xbox 360 controller disconnected");
+                }
+            }
+            if (x360w_state.input_count != prior_input_count) {
+                uint64_t now_ms = uptime_ms();
+                if (x360w_last_input_ms != 0) {
+                    uint64_t gap_ms = now_ms - x360w_last_input_ms;
+                    if (gap_ms > 50u && x360w_gap_log_count < 160u) {
+                        gp_log("slot[%d] X360W report gap[%u]=%llums before input=%u\n",
+                               slot, (unsigned)x360w_gap_log_count++,
+                               (unsigned long long)gap_ms,
+                               (unsigned)x360w_state.input_count);
+                    }
+                }
+                x360w_last_input_ms = now_ms;
+            }
         } else if (pid == PID_XBOX) {
             injected = xbox_handle_packet(fd, eps, buf, len, &pad);
         } else {
@@ -1765,7 +1952,16 @@ main_loop: ;
                 if (g_assign_slot == slot) g_assign_slot = -1;
                 gp_log("slot[%d] assignment confirmed (button press)\n", slot);
             }
-            inject_pad(slot, &pad);
+            int vdi_ret = inject_pad(slot, &pad);
+            if (is_x360w && x360w_state.face_changed &&
+                x360w_state.face_transition_count <= 240u) {
+                gp_log("slot[%d] X360W face trace[%u] input=%u prev=%02x now=%02x "
+                       "pad_buttons=0x%08x VDI=0x%08x\n",
+                       slot, (unsigned)x360w_state.face_transition_count,
+                       (unsigned)x360w_state.input_count,
+                       x360w_state.face_previous, x360w_state.face_current,
+                       pad.buttons, (uint32_t)vdi_ret);
+            }
             if ((g_slots[slot].inject_count % 600) == 0)
                 maybe_disconnect_physical_pad_for_slot(slot);
         }
@@ -2108,12 +2304,15 @@ static void graceful_shutdown_and_exit(void) {
 int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
+    if (wait_for_previous_instance() != 0) {
+        notify("Ghost-Control: existing payload did not stop - replacement aborted");
+        return 1;
+    }
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control EasySMX X10 + wired DS4 v1 candidate starting - %d slots\n",
+    gp_log("Ghost-Control Xbox 360 Wireless Receiver persistent-input v5 candidate starting - %d slots\n",
            MAX_SLOTS);
-    notify("Ghost-Control: X10 + wired DS4 v1 candidate");
+    notify("Ghost-Control: Xbox 360 receiver persistent-input v5 candidate");
 
-    wait_for_previous_instance();
     { int pfd=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
       if(pfd>=0){char pb[16];snprintf(pb,sizeof(pb),"%d",getpid());write(pfd,pb,strlen(pb));close(pfd);}
     }
