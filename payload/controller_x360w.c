@@ -17,7 +17,8 @@
 #endif
 
 int x360w_is_supported_vidpid(uint16_t vid, uint16_t pid) {
-    return vid == X360W_VID && pid == X360W_PID;
+    return vid == X360W_VID &&
+           (pid == X360W_PID || pid == X360W_PID_GENUINE);
 }
 
 const char *x360w_name(void) {
@@ -29,6 +30,9 @@ void x360w_state_init(x360w_state_t *state) {
     state->controller_present = -1;
 }
 
+/* USB_FS_COMPLETE is _IOR: it reports whichever endpoint finished and ignores
+ * the index we hand it, so a cancelled transfer can only be reaped by draining
+ * the queue until it runs dry. */
 static void x360w_stop_and_drain(int fd, uint8_t ep_index) {
     struct usb_fs_stop stop;
     struct usb_fs_complete complete;
@@ -38,23 +42,34 @@ static void x360w_stop_and_drain(int fd, uint8_t ep_index) {
     ioctl(fd, USB_FS_STOP, &stop);
     for (int pass = 0; pass < 20; pass++) {
         memset(&complete, 0, sizeof(complete));
-        complete.ep_index = ep_index;
-        if (ioctl(fd, USB_FS_COMPLETE, &complete) == 0 || errno != EBUSY)
+        if (ioctl(fd, USB_FS_COMPLETE, &complete) == 0) {
+            if (complete.ep_index == ep_index)
+                break;
+            continue;
+        }
+        if (errno != EBUSY)
             break;
         usleep(50000);
     }
 }
 
-int x360w_send_presence_inquiry(int fd, struct usb_fs_endpoint *out_ep) {
-    /* Linux xpad's XTYPE_XBOX360W receiver-presence inquiry. */
+int x360w_send_presence_inquiry(int fd, struct usb_fs_endpoint *out_ep,
+                                uint8_t ep_index) {
+    /* Linux xpad's XTYPE_XBOX360W receiver-presence inquiry.
+     * USB_FS keeps these pointers after START returns, so they must not live
+     * on this function's stack. Each pad's inquiry runs to completion before
+     * the next one starts, so one shared pair of arrays is safe. */
     static const uint8_t inquiry[12] = {
         0x08, 0x00, 0x0f, 0xc0, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    void *buffers[1] = { (void *)inquiry };
-    uint32_t lengths[1] = { sizeof(inquiry) };
+    static void *buffers[1];
+    static uint32_t lengths[1];
     struct usb_fs_start start;
     struct usb_fs_complete complete;
+
+    buffers[0] = (void *)inquiry;
+    lengths[0] = sizeof(inquiry);
 
     out_ep->ppBuffer = buffers;
     out_ep->pLength = lengths;
@@ -64,42 +79,51 @@ int x360w_send_presence_inquiry(int fd, struct usb_fs_endpoint *out_ep) {
     out_ep->aFrames = 0;
     out_ep->status = 0;
     memset(&start, 0, sizeof(start));
-    start.ep_index = 1;
+    start.ep_index = ep_index;
     if (ioctl(fd, USB_FS_START, &start) != 0) {
         int err = errno;
-        LOG("Xbox 360 receiver presence START errno=%d\n", err);
-        x360w_stop_and_drain(fd, 1);
+        LOG("Xbox 360 receiver presence START ep_index=%u errno=%d\n",
+            (unsigned)ep_index, err);
+        x360w_stop_and_drain(fd, ep_index);
         return -err;
     }
-    for (int pass = 0; pass < 20; pass++) {
+    for (int pass = 0; pass < 40; pass++) {
         memset(&complete, 0, sizeof(complete));
-        complete.ep_index = 1;
         if (ioctl(fd, USB_FS_COMPLETE, &complete) == 0) {
-            LOG("Xbox 360 receiver presence inquiry completed\n");
+            if (complete.ep_index != ep_index)
+                continue;
             return 0;
         }
         if (errno != EBUSY) {
             int err = errno;
-            LOG("Xbox 360 receiver presence COMPLETE errno=%d\n", err);
-            x360w_stop_and_drain(fd, 1);
+            LOG("Xbox 360 receiver presence COMPLETE ep_index=%u errno=%d\n",
+                (unsigned)ep_index, err);
+            x360w_stop_and_drain(fd, ep_index);
             return -err;
         }
         usleep(50000);
     }
-    LOG("Xbox 360 receiver presence timeout; endpoint stopped\n");
-    x360w_stop_and_drain(fd, 1);
+    LOG("Xbox 360 receiver presence timeout ep_index=%u; endpoint stopped\n",
+        (unsigned)ep_index);
+    x360w_stop_and_drain(fd, ep_index);
     return -EBUSY;
 }
 
-void x360w_assign_player_one_led(int fd, struct usb_fs_endpoint *out_ep) {
-    /* Linux xpad XTYPE_XBOX360W command 2: player 1/top-left blink, then on. */
-    static const uint8_t player_one[12] = {
-        0x00, 0x00, 0x08, 0x42, 0x00, 0x00,
+void x360w_set_player_led(int fd, struct usb_fs_endpoint *out_ep,
+                          uint8_t ep_index, unsigned pad_nr) {
+    /* Linux xpad XTYPE_XBOX360W LED packet: 00 00 08 4N, where N is the
+     * command. xpad_identify_controller uses (pad_nr % 4) + 2, so command 2
+     * (top-left) through 5 (bottom-left) map to pads 0 through 3. */
+    uint8_t led[12] = {
+        0x00, 0x00, 0x08, 0x40, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    int ret = usb_send_out(fd, out_ep, player_one, sizeof(player_one),
-                           "x360w-player-one");
-    LOG("Xbox 360 receiver player-1 LED ret=%d\n", ret);
+    unsigned command = (pad_nr % 4u) + 2u;
+    led[3] = (uint8_t)(0x40u + command);
+    int ret = usb_send_out_ep(fd, out_ep, ep_index, led, sizeof(led),
+                              "x360w-player-led");
+    LOG("Xbox 360 receiver pad %u LED command=%u ret=%d\n",
+        pad_nr, command, ret);
 }
 
 static void neutral_pad(ScePadData *pad) {
@@ -118,12 +142,14 @@ int x360w_handle_packet(const uint8_t *buf, uint32_t len,
         return 0;
 
     state->presence_changed = 0;
-    state->face_changed = 0;
 
     /* Receiver status packet: bit 3 means a presence update and byte 1 bit 7
-     * means the first wireless controller is connected.  Do not inject a
-     * neutral state for a normal "still present" status frame: those arrive
-     * alongside held input and would spuriously release a held button. */
+     * means the first wireless controller is connected.  xpad handles the
+     * presence change and then falls through to the pad-data check rather than
+     * returning, so a frame that carries both a status bit and input is still
+     * parsed.  Do not inject a neutral state for a normal "still present"
+     * frame: those arrive alongside held input and would spuriously release a
+     * held button. */
     if ((buf[0] & 0x08u) != 0) {
         int present = (buf[1] & 0x80u) != 0;
         int was_present = state->controller_present;
@@ -137,59 +163,20 @@ int x360w_handle_packet(const uint8_t *buf, uint32_t len,
                 return 1;
             }
         }
-        return 0;
     }
 
-    /* A wireless receiver input wrapper has byte 1 == 01.  TESTER-B's
-     * hardware captured the inner Xbox 360 report at offset 4 as 00 13;
-     * accept that exact 19-byte variant as well as the conventional 00 14
-     * variant, but never parse unrelated receiver traffic. */
+    /* A wireless receiver input wrapper has byte 1 == 01.  Linux xpad keys the
+     * inner Xbox 360 report on inner[0] == 00 alone; the inner length byte is
+     * firmware-dependent (0x13 and 0x14 both observed), so filtering on it
+     * drops legitimate button edges. */
     if (buf[1] != 0x01u || len < 18u)
         return 0;
     const uint8_t *inner = buf + 4;
-    if (inner[0] != 0x00u ||
-        (inner[1] != 0x13u && inner[1] != 0x14u))
+    if (inner[0] != 0x00u)
         return 0;
-
-    /* Trace the physical receiver's ABXY nibble separately from VDI. This is
-     * intentionally bounded at 240 transitions so a tester can run a normal
-     * game session without growing gc_status.log without limit. */
-    uint8_t face = inner[3] & 0xf0u;
-    if (!state->face_bits_valid || face != state->face_current) {
-        state->face_previous = state->face_bits_valid ? state->face_current : 0u;
-        state->face_current = face;
-        state->face_bits_valid = 1;
-        state->face_changed = 1;
-        state->face_transition_count++;
-        if (state->face_transition_count <= 240u)
-            LOG("Xbox 360 receiver face[%u] input=%u prev=%02x now=%02x\n",
-                (unsigned)state->face_transition_count,
-                (unsigned)(state->input_count + 1u),
-                state->face_previous, state->face_current);
-    }
 
     /* The inner layout is the same Xbox 360 button/trigger/stick layout
      * already hardware-validated for the XInput parser. */
     mamba_xinput_parse_input(inner, out_pad);
-    state->input_count++;
     return 1;
-}
-
-void x360w_connection_pulse(int fd, struct usb_fs_endpoint *out_ep, int slot) {
-    /* Linux xpad XTYPE_XBOX360W packet format: a short strong/weak pulse,
-     * followed by an explicit stop. It is sent only after an input report. */
-    static const uint8_t rumble[12] = {
-        0x00, 0x01, 0x0f, 0xc0, 0x00, 0x70, 0x50,
-        0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    static const uint8_t stop[12] = {
-        0x00, 0x01, 0x0f, 0xc0, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00
-    };
-    int start_ret = usb_send_out(fd, out_ep, rumble, sizeof(rumble),
-                                 "x360w-ready");
-    usleep(180000);
-    int stop_ret = usb_send_out(fd, out_ep, stop, sizeof(stop), "x360w-stop");
-    LOG("slot[%d] Xbox 360 receiver ready rumble start=%d stop=%d\n",
-        slot, start_ret, stop_ret);
 }

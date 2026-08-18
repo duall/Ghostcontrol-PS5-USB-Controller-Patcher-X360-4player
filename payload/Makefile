@@ -1,6 +1,6 @@
 PS5_HOST ?=
 PORT     ?= 9021
-TARGET   := ghost-control-x360w-functional-v5.elf
+TARGET   := ghost-control-x10-ds4-x360w.elf
 
 ifndef PS5_PAYLOAD_SDK
 $(error PS5_PAYLOAD_SDK is not set)

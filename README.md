@@ -47,6 +47,9 @@ https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
 | DualShock 4 v1 | Wired USB | 054c:05c4 | ✅ Working |
 | 8BitDo Ultimate 2 | Native | 2dc8:310b | Untested |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | 2dc8:310a | ✅ Working |
+| Xbox 360 Wireless Receiver | 4 pads, wireless | 045e:0291 / 045e:0719 | ✅ Working (`0291` tested) |
+
+**Xbox 360 Wireless Receiver:** one USB device hosting up to four pads, so each pad gets its own endpoint pair (IN `0x81`/`0x83`/`0x85`/`0x87`), its own slot, and its own virtual DualSense — which is what gives every pad a normal profile screen and its matching quadrant LED. All four work at once. `045e:0291` is the common clone ID (hardware-tested); `045e:0719` is the genuine Microsoft receiver and uses the same protocol. See [Supported_controllers.md](Supported_controllers.md#xbox-360-wireless-receiver-four-pads).
 
 See [othercontrollersGuide.md](othercontrollersGuide.md) for adding new controllers.
 
@@ -60,13 +63,13 @@ cd payload
 make clean all
 ```
 
-Output: `ghost-control-x10-ds4.elf`
+Output: `ghost-control-x10-ds4-x360w.elf`
 
 ## Deploy
 
 ```sh
 # Deploy to PS5 (replace IP)
-nc -w 5 192.168.1.xxx 9021 < payload/ghost-control-x10-ds4.elf
+nc -w 5 192.168.1.xxx 9021 < payload/ghost-control-x10-ds4-x360w.elf
 ```
 
 Or set `PS5_HOST` in your environment:

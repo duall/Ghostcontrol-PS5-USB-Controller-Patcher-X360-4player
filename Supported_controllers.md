@@ -15,6 +15,7 @@ For how to add new devices, see [othercontrollersGuide.md](othercontrollersGuide
 | EasySMX X10 | 2.4G receiver (rear switch) | `045e:028e` | XInput / Manba XUSB | Verified with the supplied receiver: IN `0x82`, OUT `0x02`, 20-byte XInput reports. The receiver's existing radio pairing is retained; Ghostcontrol does not send the Manba-specific enable packet. |
 | DualShock 4 v1 | Direct wired USB | `054c:05c4` | DS4 USB parser | Verified official v1 only: IN `0x84`, OUT `0x03`, 64-byte report `0x01`. Includes a one-time connection-confirmation rumble after input streaming begins. Bluetooth, the Sony wireless adaptor, DS4 v2, and third-party DS4-layout pads are outside this tested scope. |
 | 8BitDo Ultimate 2C Wireless (81HD) | XInput | `2dc8:310a` | Manba XUSB (reuse) | Composite device: IN `0x84`, OUT `0x05` (not classic `0x81`/`0x01`). USB-C cable and 2.4G dongle. Merged in [#19](https://github.com/StonedModder/Ghostcontrol-PS5-USB-Controller-Patcher/pull/19). |
+| Xbox 360 Wireless Receiver | 2.4G, up to 4 pads | `045e:0291` (tested) / `045e:0719` | `controller_x360w.c` → XInput parser | All four pads working simultaneously, each as a separate console controller. `0291` is the common clone ID and was hardware-tested; `0719` is the genuine Microsoft receiver and uses the same xpad `XTYPE_XBOX360W` protocol. Not the bare-XInput `045e:028e` dongles (e.g. EasySMX X10). See [Xbox 360 Wireless Receiver](#xbox-360-wireless-receiver-four-pads) below. |
 
 ---
 
@@ -51,10 +52,23 @@ Classic Manba XInput uses IN `0x81` and OUT `0x02` (fallback `0x01`). The EasySM
 
 ---
 
+## Xbox 360 Wireless Receiver (four pads)
+
+Unlike every other supported device, this is **one** USB device hosting up to four wireless pads. Five things make all four work at once:
+
+- **Per-pad endpoints.** Pad interfaces are interleaved with headset interfaces, so pads sit two addresses apart: IN `0x81`/OUT `0x01`, `0x83`/`0x03`, `0x85`/`0x05`, `0x87`/`0x07`. All eight open under one `USB_FS_INIT` with `ep_index_max = 8`; a receiver with fewer pads simply fails `USB_FS_OPEN` on the higher addresses.
+- **Completions are dispatched, not polled.** `USB_FS_COMPLETE` is `_IOR` — `ep_index` is an *output* naming whichever endpoint finished, and the value passed in is discarded. Polling it per pad credits one pad's report to another and the next arm fails with `EBUSY`. The loop reads one completion and hands it to the pad owning that endpoint.
+- **INs stay armed with no timeout.** The receiver reports *edges*, not state, so an unarmed endpoint loses a press permanently. Each pad re-arms with `timeout = 0` before its report is parsed, and a repeat injector resends held buttons.
+- **One virtual DualSense per pad.** Each pad claims its own slot and VDA on pairing, so the console treats it as a separate controller and shows its normal profile screen instead of taking over pad 1.
+- **LED on the presence edge.** The receiver drops the quadrant-LED command unless a pad is paired, so it is sent on the present transition. PS5 `USB_FS` rejects an OUT while interrupt INs are armed, so the INs are stopped and drained for that one OUT.
+
+---
+
 ## Sources
 
 - `payload/gc_main.c` — scan, probe, USB threads
 - `payload/controller_mamba.h` / `controller_mamba.c` — Manba + shared XUSB parser
 - `payload/controller_nintendo.c` — Switch Pro protocol
 - `payload/controller_ds4.c` — wired DualShock 4 input parser
+- `payload/controller_x360w.c` — Xbox 360 Wireless Receiver packet unwrap, presence, LED
 - `README.md` — quick reference table
