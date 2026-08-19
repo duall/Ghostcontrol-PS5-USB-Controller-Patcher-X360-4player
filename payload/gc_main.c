@@ -46,6 +46,7 @@
 #include "controller_xbox.h"
 #include "controller_ds4.h"
 #include "controller_mamba.h"
+#include "controller_x360w.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -119,17 +120,17 @@ static void write_handoff_ack(void) {
 /* A replacement payload must not touch /dev/ugen until the old payload has
  * released USB_FS.  The acknowledgement is used by new builds; liveness is
  * retained as a safe fallback when replacing an older payload. */
-static void wait_for_previous_instance(void) {
+static int wait_for_previous_instance(void) {
     char buf[24] = {0};
     int fd = open(PID_PATH, O_RDONLY);
     if (fd < 0)
-        return;
+        return 0;
     read(fd, buf, sizeof(buf) - 1);
     close(fd);
 
     pid_t old = (pid_t)atoi(buf);
     if (old <= 0 || old == getpid())
-        return;
+        return 0;
 
     unlink(HANDOFF_PATH); /* never accept an acknowledgement from an older run */
     gp_log("handoff: requesting shutdown from pid=%d\n", old);
@@ -149,12 +150,15 @@ static void wait_for_previous_instance(void) {
         }
         usleep(100000);
     }
-    if (!acknowledged && pid_is_alive(old))
-        gp_log("handoff: pid=%d did not exit in time; continuing cautiously\n", old);
+    if (!acknowledged && pid_is_alive(old)) {
+        gp_log("handoff: pid=%d did not exit in time; aborting replacement\n", old);
+        return -1;
+    }
 
     /* The X10 can re-enumerate after USB_FS ownership changes.  Give it a
      * quiet interval before discovery; the warm-up gate below verifies it. */
     g_usb_settle_until_ms = uptime_ms() + 1500;
+    return 0;
 }
 
 /* ── SCE stubs ────────────────────────────────────────────────────────── */
@@ -459,6 +463,23 @@ static void inject_pad(int slot, const ScePadData *pad) {
     if (vr != 0 && !vdi_err_logged) { gp_log("VDI error 0x%08x\n",(uint32_t)vr); vdi_err_logged=1; }
 }
 
+/* Repeat the last 360-receiver pad while the IN endpoint is armed and idle.
+ * The receiver only reports edges, so a held button has to be resent from here.
+ * Stamp a unique timestamp so a consumer that deduplicates identical
+ * ScePadData samples cannot collapse a hold into one sample. */
+static void x360w_inject_repeat(int slot, ScePadData *last, int have,
+                                uint64_t *next_ms)
+{
+    if (!have)
+        return;
+    uint64_t now = uptime_ms();
+    if (now < *next_ms)
+        return;
+    last->timestamp = now * 1000ull;
+    inject_pad(slot, last);
+    *next_ms = now + 8;
+}
+
 /* ── ugen detection ───────────────────────────────────────────────────── */
 #define VID_NATIVE  0x2dc8u
 #define PID_NATIVE  0x310bu
@@ -484,12 +505,16 @@ static int is_official_wired_ds4_v1(uint16_t vid, uint16_t pid) {
 
 static int is_supported_controller(uint16_t vid, uint16_t pid) {
     return mamba_is_supported_vidpid(vid, pid) ||
-           is_official_wired_ds4_v1(vid, pid);
+           is_official_wired_ds4_v1(vid, pid) ||
+           x360w_is_supported_vidpid(vid, pid);
 }
 
 static const char *controller_name(uint16_t vid, uint16_t pid) {
-    return is_official_wired_ds4_v1(vid, pid) ? "DualShock 4 v1 (wired)" :
-                                                mamba_name(vid, pid);
+    if (is_official_wired_ds4_v1(vid, pid))
+        return "DualShock 4 v1 (wired)";
+    if (x360w_is_supported_vidpid(vid, pid))
+        return x360w_name();
+    return mamba_name(vid, pid);
 }
 
 /* Match a (vid,pid) against our supported controller table.
@@ -1116,6 +1141,203 @@ static int32_t create_vda_for_slot(int slot) {
     return handle;
 }
 
+/* ── Xbox 360 receiver: one wireless pad ──────────────────────────────────
+ * The receiver is a single USB device, so one reader thread owns all four
+ * pads.  Every pad keeps its IN transfer armed at the same time, which means
+ * each one needs its own receive buffer and its own ppBuffer/pLength arrays:
+ * USB_FS retains those pointers for the life of a transfer, so sharing them
+ * across endpoints would let one completion overwrite a descriptor that
+ * another endpoint is still using. */
+typedef struct {
+    uint8_t    in_addr;         /* 0x81, 0x83, 0x85, 0x87 */
+    uint8_t    out_addr;        /* 0x01, 0x03, 0x05, 0x07 */
+    uint8_t    ep_in;           /* USB_FS ep_index for IN  */
+    uint8_t    ep_out;          /* USB_FS ep_index for OUT */
+    int        in_opened;
+    int        out_opened;
+    int        pending;         /* IN transfer is armed */
+    uint32_t   in_len;          /* negotiated wMaxPacketSize */
+    void      *ppbuf[1];
+    uint32_t   plen[1];
+    uint8_t    buf[64];
+    uint8_t    rep[64];
+    x360w_state_t state;
+    int        slot;            /* ctrl slot driven by this pad, -1 if none */
+    int        owns_slot;       /* slot was claimed here, so release it here */
+    int        led_done;
+    int        ready_notified;
+    ScePadData last_pad;
+    int        have_pad;
+    uint64_t   next_inject_ms;
+} x360w_pad_t;
+
+/* Arm this pad's interrupt IN.  timeout=0 is USB_NO_TIMEOUT: the transfer
+ * stays armed until a packet actually arrives rather than expiring and leaving
+ * the endpoint unarmed across the restart, which is what silently swallowed
+ * button edges.  That mirrors xpad, which never times out its input URB.  PS5
+ * USB_FS panics on nFrames>1 interrupt copyout, so this stays one frame. */
+static int x360w_arm_in(int fd, struct usb_fs_endpoint *ep, x360w_pad_t *pd) {
+    struct usb_fs_start start;
+
+    pd->ppbuf[0] = pd->buf;
+    pd->plen[0]  = pd->in_len;
+    ep->ppBuffer = pd->ppbuf;
+    ep->pLength  = pd->plen;
+    ep->nFrames  = 1;
+    ep->timeout  = 0;
+    ep->flags    = USB_FS_FLAG_SINGLE_SHORT_OK | USB_FS_FLAG_MULTI_SHORT_OK;
+    ep->aFrames  = 0;
+    ep->status   = 0;
+
+    memset(&start, 0, sizeof(start));
+    start.ep_index = pd->ep_in;
+    if (ioctl(fd, USB_FS_START, &start) != 0)
+        return -errno;
+    pd->pending = 1;
+    return 0;
+}
+
+/* Cancel every armed IN, then light this pad's quadrant LED.
+ *
+ * Two constraints force this shape.  The receiver discards an LED command
+ * unless a controller is actually paired, so it cannot be sent at startup —
+ * that is why the light stayed in its unassigned blink.  And PS5 USB_FS does
+ * not tolerate an OUT request while interrupt INs are armed, which is why the
+ * original single-pad path closed OUT before entering the main loop.  Stopping
+ * the INs for the duration of one OUT satisfies both.  The main loop re-arms
+ * on its next pass, and this runs once per connect, never during play. */
+static void x360w_led_on_connect(int fd, struct usb_fs_endpoint *eps,
+                                 x360w_pad_t *pads, unsigned count,
+                                 unsigned pad_nr) {
+    struct usb_fs_stop     stop;
+    struct usb_fs_complete complete;
+
+    unsigned stopped = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (!pads[i].pending)
+            continue;
+        memset(&stop, 0, sizeof(stop));
+        stop.ep_index = pads[i].ep_in;
+        ioctl(fd, USB_FS_STOP, &stop);
+        pads[i].pending = 0;
+        stopped++;
+    }
+
+    /* A cancelled transfer still reports a completion, and USB_FS_COMPLETE hands
+     * back whichever endpoint finished rather than one we ask for.  Reap those
+     * here so a leftover cancellation cannot later be mistaken for a report and
+     * clear the armed flag of a freshly armed transfer. */
+    for (unsigned reaped = 0, idle = 0; reaped < stopped && idle < 20; ) {
+        memset(&complete, 0, sizeof(complete));
+        if (ioctl(fd, USB_FS_COMPLETE, &complete) == 0) {
+            reaped++;
+            continue;
+        }
+        if (errno != EBUSY)
+            break;
+        idle++;
+        usleep(1000);
+    }
+    x360w_set_player_led(fd, &eps[pads[pad_nr].ep_out],
+                         pads[pad_nr].ep_out, pad_nr);
+}
+
+/* Give a newly paired receiver pad its own slot and virtual DualSense, so the
+ * console sees four separate devices instead of four pads sharing one.
+ *
+ * This blocks the reader for as long as create_vda_for_slot waits on klog, so
+ * an already-active pad can lose an edge while another one pairs. Moving it off
+ * the reader thread would mean two threads in the ptrace/force_bind path at
+ * once, which is a worse trade than a dropped press during pairing. */
+static int x360w_claim_slot(int primary_slot, unsigned pad_nr,
+                            uint16_t vid, uint16_t pid, const char *dev_path) {
+    int s = -1;
+
+    pthread_mutex_lock(&g_slot_lock);
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (g_slots[i].handle < 0 && !g_slots[i].usb_active) { s = i; break; }
+    }
+    if (s >= 0) {
+        strncpy(g_slots[s].dev_path, dev_path, sizeof(g_slots[s].dev_path) - 1);
+        g_slots[s].usb_active           = 1;
+        g_slots[s].release_requested    = 0;
+        g_slots[s].released_pause       = 0;
+        g_slots[s].release_wait_neutral = 0;
+        g_slots[s].confirmed            = 0;
+        g_slots[s].vid                  = vid;
+        g_slots[s].pid                  = pid;
+        g_slots[s].virtual_dev_id       = 0;
+        g_slots[s].evicted_physical_dev = 0;
+        g_slots[s].physical_evict_done  = 0;
+        g_slots[s].inject_count         = 0;
+        g_slots[s].usb_fd               = -1;
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+
+    if (s < 0) {
+        gp_log("slot[%d] X360W pad %u: no free slot\n", primary_slot, pad_nr);
+        return -1;
+    }
+
+    g_assign_slot = s;
+    int32_t h = create_vda_for_slot(s);
+    if (h < 0) {
+        gp_log("slot[%d] X360W pad %u VDA failed for slot[%d]\n",
+               primary_slot, pad_nr, s);
+        pthread_mutex_lock(&g_slot_lock);
+        g_slots[s].handle          = -1;
+        g_slots[s].usb_active      = 0;
+        g_slots[s].virtual_dev_id  = 0;
+        g_slots[s].dev_path[0]     = '\0';
+        pthread_mutex_unlock(&g_slot_lock);
+        g_assign_slot = -1;
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_slot_lock);
+    g_slots[s].handle    = h;
+    g_slots[s].vdi_ready = 1;
+    pthread_mutex_unlock(&g_slot_lock);
+    gp_log("slot[%d] X360W pad %u -> slot[%d] handle=0x%x\n",
+           primary_slot, pad_nr, s, (uint32_t)h);
+    notify("Ghost-Control: Xbox 360 pad %u ready - press a button to assign",
+           pad_nr + 1);
+    return s;
+}
+
+/* Tear down a slot claimed by x360w_claim_slot when its pad powers off. */
+static void x360w_release_slot(int s, unsigned pad_nr) {
+    if (s < 0 || s >= MAX_SLOTS)
+        return;
+
+    uint64_t vdev = g_slots[s].virtual_dev_id;
+    if (vdev) {
+        int r = shellui_pad_disconnect_device(vdev);
+        gp_log("slot[%d] X360W pad %u disconnect virtual dev=0x%llx ret=%d\n",
+               s, pad_nr, (unsigned long long)vdev, r);
+    }
+    scePadVirtualDeviceDeleteDevice(g_slots[s].handle);
+
+    pthread_mutex_lock(&g_slot_lock);
+    g_slots[s].handle               = -1;
+    g_slots[s].vdi_ready            = 0;
+    g_slots[s].usb_active           = 0;
+    g_slots[s].release_requested    = 0;
+    g_slots[s].released_pause       = 0;
+    g_slots[s].release_wait_neutral = 0;
+    g_slots[s].confirmed            = 0;
+    g_slots[s].usb_fd               = -1;
+    g_slots[s].virtual_dev_id       = 0;
+    g_slots[s].evicted_physical_dev = 0;
+    g_slots[s].physical_evict_done  = 0;
+    g_slots[s].dev_path[0]          = '\0';
+    pthread_mutex_unlock(&g_slot_lock);
+
+    if (g_assign_slot == s)
+        g_assign_slot = -1;
+    gp_log("slot[%d] X360W pad %u released\n", s, pad_nr);
+}
+
 /* ── USB HID thread ───────────────────────────────────────────────────── */
 /* Single-session: receives slot+path+vid+pid, runs until disconnect, then exits.
  * Manager thread handles re-detection after exit. */
@@ -1336,7 +1558,8 @@ static void *usb_hid_thread(void *arg) {
     int preopened_fd = targ->preopened_fd;
     free(targ);
 
-    struct usb_fs_endpoint eps[2];
+    /* The Xbox 360 receiver needs one IN plus one OUT per wireless pad. */
+    struct usb_fs_endpoint eps[2 * X360W_MAX_PADS];
     struct usb_fs_init     init;
     struct usb_fs_open     fs_open;
     struct usb_fs_start    start;
@@ -1354,7 +1577,23 @@ static void *usb_hid_thread(void *arg) {
     int x10_have_last_raw = 0;
     uint8_t x10_last_raw[8];
     uint8_t xinput_in_ep = 0;
+    int xinput_diag_enabled = 0;
+    uint32_t xinput_diag_total = 0;
+    uint32_t xinput_diag_valid = 0;
+    uint32_t xinput_diag_rejected = 0;
+    uint32_t xinput_diag_changes = 0;
+    uint32_t xinput_diag_reject_logs = 0;
+    int xinput_diag_have_last = 0;
+    uint8_t xinput_diag_last[14];
+    x360w_pad_t x360w_pads[X360W_MAX_PADS];
+    unsigned x360w_pad_count = 0;
+    int x360w_dev = 0;
+    int x360w_armed_logged = 0;
     int usb_ready_notified = 0;
+
+    memset(x360w_pads, 0, sizeof(x360w_pads));
+    for (unsigned xp = 0; xp < X360W_MAX_PADS; xp++)
+        x360w_pads[xp].slot = -1;   /* zeroed would read as slot 0 */
 
     gp_log("slot[%d] USB thread: %s VID=0x%04x PID=0x%04x\n",
            slot, dev_path, vid, pid);
@@ -1478,6 +1717,111 @@ static void *usb_hid_thread(void *arg) {
         } else if (out_opened) {
             mamba_xinput_send_enable(fd, eps);
         }
+        /* This R&D build observes only the direct 045e:028e / IN 0x81
+         * profile reported by the Xbox tester.  X10 wireless uses IN 0x82,
+         * so it retains its normal path without this extra telemetry. */
+        if (vid == MAMBA_XINPUT_VID && pid == MAMBA_XINPUT_PID &&
+            xinput_in_ep == 0x81u) {
+            xinput_diag_enabled = 1;
+            gp_log("slot[%d] XInput R&D #1 active: direct 045e:028e IN=0x81; "
+                   "logging state changes and non-00/14 packets\n", slot);
+        }
+        goto main_loop;
+    }
+
+    /* ── Xbox 360 Wireless Receiver: 045e:0291 / 045e:0719 ───────────── */
+    if (x360w_is_supported_vidpid(vid, pid)) {
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { gp_log("slot[%d] Xbox 360 receiver open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        x360w_dev = 1;
+        /* One interface per pad plus one headset interface each. */
+        { int ii; for (ii = 0; ii < (int)(2 * X360W_MAX_PADS); ii++) { int i2 = ii; ioctl(fd, USB_IFACE_DRIVER_DETACH, &i2); } }
+        usleep(120000);
+        memset(eps, 0, sizeof(eps)); memset(&init, 0, sizeof(init));
+        init.pEndpoints = eps; init.ep_index_max = 2 * X360W_MAX_PADS;
+        if (ioctl(fd, USB_FS_INIT, &init) != 0) {
+            gp_log("slot[%d] Xbox 360 receiver FS_INIT fail errno=%d\n", slot, errno);
+            close(fd); goto exit_slot;
+        }
+
+        /* Probe each pad's interrupt pair in order.  A receiver that hosts
+         * fewer than four pads fails USB_FS_OPEN on the higher addresses, so
+         * the first gap ends the scan and the session simply runs with the
+         * pads that answered. */
+        for (unsigned p = 0; p < X360W_MAX_PADS; p++) {
+            x360w_pad_t *pd = &x360w_pads[p];
+            unsigned in_maxpkt;
+
+            pd->in_addr  = X360W_PAD_EP_IN(p);
+            pd->out_addr = X360W_PAD_EP_OUT(p);
+            pd->ep_in    = (uint8_t)p;
+            pd->ep_out   = (uint8_t)(X360W_MAX_PADS + p);
+            pd->in_len   = 32;
+            pd->slot     = -1;
+            x360w_state_init(&pd->state);
+
+            memset(&fs_open, 0, sizeof(fs_open));
+            fs_open.ep_index = pd->ep_in; fs_open.ep_no = pd->in_addr;
+            fs_open.max_bufsize = 64; fs_open.max_frames = 1;
+            if (ioctl(fd, USB_FS_OPEN, &fs_open) != 0) {
+                if (p == 0) {
+                    gp_log("slot[%d] Xbox 360 receiver IN 0x%02x fail errno=%d\n",
+                           slot, pd->in_addr, errno);
+                    goto uninit_exit;
+                }
+                gp_log("slot[%d] X360W IN 0x%02x unavailable errno=%d — "
+                       "receiver hosts %u pad(s)\n",
+                       slot, pd->in_addr, errno, x360w_pad_count);
+                break;
+            }
+            pd->in_opened = 1;
+            /* Request exactly wMaxPacketSize.  Without a transfer timeout a
+             * full-size packet has to terminate the transfer by filling the
+             * buffer, otherwise it waits for a second packet and merges two
+             * reports into one completion. */
+            in_maxpkt = (unsigned)fs_open.max_packet_length;
+            if (in_maxpkt >= 2 && in_maxpkt <= sizeof(pd->buf))
+                pd->in_len = in_maxpkt;
+
+            memset(&fs_open, 0, sizeof(fs_open));
+            fs_open.ep_index = pd->ep_out; fs_open.ep_no = pd->out_addr;
+            fs_open.max_bufsize = 64; fs_open.max_frames = 1;
+            pd->out_opened = (ioctl(fd, USB_FS_OPEN, &fs_open) == 0) ? 1 : 0;
+
+            x360w_pad_count = p + 1;
+            gp_log("slot[%d] X360W pad %u IN=0x%02x maxpkt=%u req=%u "
+                   "OUT=0x%02x opened=%d\n",
+                   slot, p, pd->in_addr, in_maxpkt, (unsigned)pd->in_len,
+                   pd->out_addr, pd->out_opened);
+
+            if (!pd->out_opened) {
+                if (p == 0) {
+                    gp_log("slot[%d] X360W pad 0 OUT 0x%02x failed; refusing "
+                           "unsafe session\n", slot, pd->out_addr);
+                    goto reinit;
+                }
+                continue;
+            }
+
+            /* xpad sends this per pad from xpad360w_start_input: it forces the
+             * receiver to resend connection packets, which is how we learn
+             * about pads that were already paired before we attached. */
+            if (x360w_send_presence_inquiry(fd, &eps[pd->ep_out],
+                                            pd->ep_out) != 0 && p == 0) {
+                gp_log("slot[%d] X360W presence inquiry failed; refusing "
+                       "unsafe session\n", slot);
+                goto reinit;
+            }
+        }
+
+        /* Pad 0 inherits the slot the manager already created a VDA for.  The
+         * rest claim their own slot when they actually pair. */
+        x360w_pads[0].slot = slot;
+        gp_log("slot[%d] X360W presence complete on %u pad(s); persistent INs "
+               "will arm\n", slot, x360w_pad_count);
+        notify("Ghost-Control: Xbox 360 receiver ready (%u pads) - pair then press a button",
+               x360w_pad_count);
         goto main_loop;
     }
 
@@ -1612,8 +1956,9 @@ main_loop: ;
     int is_ds4 = (vid == VID_SONY || vid == VID_HORI);
     int is_mamba_xinput = mamba_is_xinput_vidpid(vid, pid);
     int is_mamba_switch = mamba_is_switch_vidpid(vid, pid);
+    int is_x360w = x360w_is_supported_vidpid(vid, pid);
     int is_x10_profile = (switch_in_ep == 0x84 && switch_out_ep == 0x03);
-    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput ||
+    int hs_state = (pid==PID_XBOX || is_ds4 || is_mamba_xinput || is_x360w ||
                     is_x10_profile) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
     int x10_ready_pulse_pending = (is_mamba_switch && switch_in_ep == 0x84 &&
@@ -1627,40 +1972,286 @@ main_loop: ;
             release_mamba_vda_only(slot, "official same user reclaim");
         }
 
-        memset(buf,0,64);
-        buffers[0]=buf; lengths[0]=64;
-        eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
-        eps[0].aFrames=0; eps[0].status=0;
+        uint32_t len = 0;
+        if (is_x360w) {
+            /* This receiver reports edges, not state: a press is one packet
+             * that is never resent, so an endpoint that is not armed loses it
+             * permanently.  Every pad therefore stays armed with no timeout at
+             * all times.  See x360w_arm_in for the timeout reasoning. */
+            for (unsigned ap = 0; ap < x360w_pad_count; ap++) {
+                x360w_pad_t *apd = &x360w_pads[ap];
+                if (!apd->in_opened || apd->pending)
+                    continue;
+                int arm = x360w_arm_in(fd, &eps[apd->ep_in], apd);
+                if (arm != 0) {
+                    gp_log("slot[%d] X360W pad %u IN re-arm errno=%d\n",
+                           slot, ap, -arm);
+                    memset(&stop, 0, sizeof(stop));
+                    stop.ep_index = apd->ep_in;
+                    ioctl(fd, USB_FS_STOP, &stop);
+                    goto reinit;
+                }
+            }
+            if (!x360w_armed_logged) {
+                gp_log("slot[%d] X360W persistent IN armed on %u pad(s)\n",
+                       slot, x360w_pad_count);
+                x360w_armed_logged = 1;
+            }
 
-        memset(&start,0,sizeof(start)); start.ep_index=0;
-        if (ioctl(fd,USB_FS_START,&start)!=0) {
-            if (errno==EBUSY){
-                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-                usleep(5000);
-            } else if (errno==ENXIO||errno==ENOTTY){
-                gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
-            } else {
-                gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+            /* USB_FS_COMPLETE is _IOR: ep_index is an output naming whichever
+             * endpoint finished and the value passed in is discarded, so this
+             * cannot be polled per pad.  Doing that credits one pad's report to
+             * another, which clears the armed flag of a transfer that is still
+             * outstanding and makes the next arm fail with EBUSY.  Read one
+             * completion and hand it to the pad that owns the endpoint. */
+            memset(&complete, 0, sizeof(complete));
+            if (ioctl(fd, USB_FS_COMPLETE, &complete) != 0) {
+                int cerr = errno;
+                if (cerr == EBUSY) {
+                    /* Nothing has finished yet — the normal state between
+                     * reports. */
+                    for (unsigned rp = 0; rp < x360w_pad_count; rp++) {
+                        x360w_pad_t *rpd = &x360w_pads[rp];
+                        if (rpd->slot >= 0)
+                            x360w_inject_repeat(rpd->slot, &rpd->last_pad,
+                                                rpd->have_pad,
+                                                &rpd->next_inject_ms);
+                    }
+                    usleep(1000);
+                    continue;
+                }
+                if (cerr == ENXIO || cerr == ENOTTY)
+                    gp_log("slot[%d] X360W complete errno=%d — device gone\n",
+                           slot, cerr);
+                else
+                    gp_log("slot[%d] X360W complete fatal errno=%d\n", slot, cerr);
+                goto reinit;
+            }
+
+            /* Only the owning pad matches, so this services one report and then
+             * falls through to read the next completion. */
+            for (unsigned p = 0; p < x360w_pad_count; p++) {
+                x360w_pad_t *pd = &x360w_pads[p];
+                if (!pd->in_opened || pd->ep_in != complete.ep_index)
+                    continue;
+                pd->pending = 0;
+
+                /* A failed transfer leaves the length at the requested size, so
+                 * length alone cannot separate an error from real data.  With no
+                 * timeout this only trips on a cancel or a genuine error. */
+                int have_report = (eps[pd->ep_in].status == 0 && pd->plen[0] >= 2);
+                if (have_report) {
+                    len = pd->plen[0] < sizeof(pd->rep) ? pd->plen[0]
+                                                        : (uint32_t)sizeof(pd->rep);
+                    memcpy(pd->rep, pd->buf, len);
+                }
+
+                /* Re-arm before parsing and injecting. The receiver keeps only the
+                 * newest report for an unpolled endpoint, so any work done while no
+                 * transfer is armed collapses press/release pairs. A failed re-arm
+                 * is left for the next pass, which reinits. */
+                x360w_arm_in(fd, &eps[pd->ep_in], pd);
+
+                if (!have_report)
+                    continue;
+
+                ScePadData pad;
+                memset(&pad, 0, sizeof(pad));
+                pad.quat.w = 1.0f;
+                int injected = x360w_handle_packet(pd->rep, len, &pd->state, &pad);
+                if (pd->state.presence_changed) {
+                    if (pd->state.controller_present > 0) {
+                        notify("Ghost-Control: Xbox 360 pad %u paired - press a button to assign",
+                               p + 1);
+                        /* The receiver only honours the LED command once a pad
+                         * is actually paired, so this is the edge to send it. */
+                        if (pd->out_opened && !pd->led_done) {
+                            x360w_led_on_connect(fd, eps, x360w_pads,
+                                                 x360w_pad_count, p);
+                            pd->led_done = 1;
+                        }
+                    } else {
+                        notify("Ghost-Control: Xbox 360 pad %u disconnected", p + 1);
+                        pd->led_done = 0;
+                    }
+                }
+                if (injected) {
+                    pad.timestamp = uptime_ms() * 1000ull;
+                    memcpy(&pd->last_pad, &pad, sizeof(pd->last_pad));
+                    pd->have_pad = 1;
+                    pd->next_inject_ms = uptime_ms() + 8;
+                }
+                if (pd->state.presence_changed &&
+                    pd->state.controller_present == 0) {
+                    pd->have_pad = 0;
+                }
+
+                /* A pad that pairs after startup needs its own slot and virtual
+                 * device so it reaches the console as a separate controller.
+                 * The assignment gate stops two dialogs from stacking, so a
+                 * blocked pad simply retries on its next report. */
+                if (pd->slot < 0 && pd->state.controller_present > 0 &&
+                    g_assign_slot < 0) {
+                    int claimed = x360w_claim_slot(slot, p, vid, pid, dev_path);
+                    if (claimed >= 0) {
+                        pd->slot = claimed;
+                        pd->owns_slot = 1;
+                    }
+                }
+
+                int pslot = pd->slot;
+                if (pslot < 0)
+                    continue;
+
+                if (g_slots[pslot].released_pause) {
+                    if (injected > 0) {
+                        if (g_slots[pslot].release_wait_neutral) {
+                            if (pad.buttons == 0) {
+                                g_slots[pslot].release_wait_neutral = 0;
+                                gp_log("slot[%d] release pause neutral seen - waiting for new button\n", pslot);
+                                notify("Ghost-Control: pad released - press a button to reassign");
+                            }
+                            continue;
+                        }
+                        if (pad.buttons != 0) {
+                            if (g_assign_slot >= 0 && g_assign_slot != pslot) {
+                                gp_log("slot[%d] release pause reassign blocked by assign_slot=%d\n",
+                                       pslot, g_assign_slot);
+                                continue;
+                            }
+                            gp_log("slot[%d] release pause button press - recreating VDA\n", pslot);
+                            g_assign_slot = pslot;
+                            int32_t new_handle = create_vda_for_slot(pslot);
+                            if (new_handle < 0) {
+                                gp_log("slot[%d] release pause VDA recreate failed\n", pslot);
+                                g_assign_slot = -1;
+                                continue;
+                            }
+                            pthread_mutex_lock(&g_slot_lock);
+                            g_slots[pslot].handle = new_handle;
+                            g_slots[pslot].vdi_ready = 1;
+                            g_slots[pslot].released_pause = 0;
+                            g_slots[pslot].release_wait_neutral = 0;
+                            g_slots[pslot].confirmed = 0;
+                            g_slots[pslot].inject_count = 0;
+                            pthread_mutex_unlock(&g_slot_lock);
+                            notify("Ghost-Control by StonedModder: slot[%d] ready - press a button to assign", pslot);
+                            gp_log("slot[%d] release pause VDA recreated handle=0x%x\n",
+                                   pslot, (uint32_t)new_handle);
+                        }
+                    }
+                    continue;
+                }
+
+                if (injected > 0) {
+                    if (!pd->ready_notified) {
+                        notify("Ghost-Control by StonedModder: slot[%d] streaming - Xbox 360 pad %u active",
+                               pslot, p + 1);
+                        pd->ready_notified = 1;
+                        usb_ready_notified = 1;
+                    }
+                    if (!g_slots[pslot].confirmed && pad.buttons != 0) {
+                        g_slots[pslot].confirmed = 1;
+                        if (g_assign_slot == pslot) g_assign_slot = -1;
+                        gp_log("slot[%d] assignment confirmed (button press)\n", pslot);
+                    }
+                    inject_pad(pslot, &pad);
+                    if ((g_slots[pslot].inject_count % 600) == 0)
+                        maybe_disconnect_physical_pad_for_slot(pslot);
+                }
+
+                /* Pad powered off.  The neutral state above has already
+                 * released any held button, so a slot claimed for this pad can
+                 * go back to the pool.  Pad 0 keeps the slot the manager gave
+                 * the thread, which is freed when the thread exits. */
+                if (pd->state.presence_changed &&
+                    pd->state.controller_present == 0 && pd->owns_slot) {
+                    x360w_release_slot(pslot, p);
+                    pd->owns_slot = 0;
+                    pd->slot = -1;
+                    pd->ready_notified = 0;
+                }
             }
             continue;
+        } else {
+            memset(buf,0,64);
+            buffers[0]=buf; lengths[0]=64;
+            eps[0].ppBuffer=buffers; eps[0].pLength=lengths;
+            eps[0].aFrames=0; eps[0].status=0;
+
+            memset(&start,0,sizeof(start)); start.ep_index=0;
+            if (ioctl(fd,USB_FS_START,&start)!=0) {
+                if (errno==EBUSY){
+                    memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                    usleep(5000);
+                } else if (errno==ENXIO||errno==ENOTTY){
+                    gp_log("slot[%d] START errno=%d — device gone\n",slot,errno); goto reinit;
+                } else {
+                    gp_log("slot[%d] START fatal errno=%d\n",slot,errno); goto reinit;
+                }
+                continue;
+            }
+
+            int ok=0, cerr=0, cw=0;
+            for(cw=0;cw<60;cw++){
+                memset(&complete,0,sizeof(complete)); complete.ep_index=0;
+                if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
+                cerr=errno;
+                if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
+                if(cerr!=EBUSY) break;
+                usleep(500);
+            }
+            if(!ok){
+                memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+                continue;
+            }
+            if(lengths[0]<1) continue;
+            len = lengths[0];
         }
 
-        int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<60;cw++){
-            memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
-            cerr=errno;
-            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
-            if(cerr!=EBUSY) break;
-            usleep(500);
+        if (xinput_diag_enabled) {
+            int valid_xinput = len >= 14 && buf[0] == 0x00u && buf[1] == 0x14u;
+            xinput_diag_total++;
+            if (valid_xinput) {
+                xinput_diag_valid++;
+                if (!xinput_diag_have_last ||
+                    memcmp(buf, xinput_diag_last, sizeof(xinput_diag_last)) != 0) {
+                    if (xinput_diag_changes < 200) {
+                        gp_log("slot[%d] XInput R&D state[%u] len=%u: "
+                               "%02x %02x %02x %02x %02x %02x %02x %02x "
+                               "%02x %02x %02x %02x %02x %02x\n",
+                               slot, (unsigned)xinput_diag_changes, (unsigned)len,
+                               buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                               buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                               buf[12], buf[13]);
+                    }
+                    xinput_diag_changes++;
+                    memcpy(xinput_diag_last, buf, sizeof(xinput_diag_last));
+                    xinput_diag_have_last = 1;
+                }
+            } else {
+                xinput_diag_rejected++;
+                if (xinput_diag_reject_logs < 80) {
+                    uint8_t b1 = len > 1 ? buf[1] : 0;
+                    uint8_t b2 = len > 2 ? buf[2] : 0;
+                    uint8_t b3 = len > 3 ? buf[3] : 0;
+                    uint8_t b4 = len > 4 ? buf[4] : 0;
+                    uint8_t b5 = len > 5 ? buf[5] : 0;
+                    uint8_t b6 = len > 6 ? buf[6] : 0;
+                    uint8_t b7 = len > 7 ? buf[7] : 0;
+                    gp_log("slot[%d] XInput R&D rejected[%u] len=%u: "
+                           "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           slot, (unsigned)xinput_diag_reject_logs++, (unsigned)len,
+                           buf[0], b1, b2, b3, b4, b5, b6, b7);
+                }
+            }
+            if ((xinput_diag_total % 600u) == 0u) {
+                gp_log("slot[%d] XInput R&D stats total=%u valid=%u rejected=%u "
+                       "state_changes=%u\n", slot, (unsigned)xinput_diag_total,
+                       (unsigned)xinput_diag_valid, (unsigned)xinput_diag_rejected,
+                       (unsigned)xinput_diag_changes);
+            }
         }
-        if(!ok){
-            memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-            continue;
-        }
-        if(lengths[0]<1) continue;
-
-        uint32_t len = lengths[0];
 
         if (is_x10_profile && x10_raw_log_count < 16) {
             uint8_t b1 = len > 1 ? buf[1] : 0;
@@ -1774,17 +2365,46 @@ main_loop: ;
 reinit:
     g_slots[slot].usb_fd = -1;  /* unregister before teardown */
     if (usb_ready_notified) { notify("Ghost-Control by StonedModder: slot[%d] controller disconnected", slot); usb_ready_notified=0; }
-    memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
-    if (out_opened) {
-        memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=1; ioctl(fd,USB_FS_CLOSE,&fs_close);
-        out_opened=0;
+    if (x360w_dev) {
+        /* The receiver owns up to eight endpoints and, for pads past the
+         * first, up to three extra slots that this thread claimed. */
+        for (unsigned p = 0; p < x360w_pad_count; p++) {
+            x360w_pad_t *pd = &x360w_pads[p];
+            if (pd->in_opened) {
+                memset(&stop,0,sizeof(stop)); stop.ep_index=pd->ep_in;
+                ioctl(fd,USB_FS_STOP,&stop);
+                memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=pd->ep_in;
+                ioctl(fd,USB_FS_CLOSE,&fs_close);
+                pd->in_opened = 0; pd->pending = 0;
+            }
+            if (pd->out_opened) {
+                memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=pd->ep_out;
+                ioctl(fd,USB_FS_CLOSE,&fs_close);
+                pd->out_opened = 0;
+            }
+        }
+    } else {
+        memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
+        if (out_opened) {
+            memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=1; ioctl(fd,USB_FS_CLOSE,&fs_close);
+            out_opened=0;
+        }
+        memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=0; ioctl(fd,USB_FS_CLOSE,&fs_close);
     }
-    memset(&fs_close,0,sizeof(fs_close)); fs_close.ep_index=0; ioctl(fd,USB_FS_CLOSE,&fs_close);
 uninit_exit:
     memset(&uninit,0,sizeof(uninit)); ioctl(fd,USB_FS_UNINIT,&uninit);
     close(fd); fd=-1;
 
 exit_slot:
+    /* Slots claimed for pads 1..3 belong to this thread, so they cannot wait
+     * for the generic single-slot cleanup below. */
+    for (unsigned p = 0; p < x360w_pad_count; p++) {
+        if (x360w_pads[p].owns_slot && x360w_pads[p].slot >= 0) {
+            x360w_release_slot(x360w_pads[p].slot, p);
+            x360w_pads[p].owns_slot = 0;
+            x360w_pads[p].slot = -1;
+        }
+    }
     gp_log("slot[%d] USB thread exiting — freeing slot\n", slot);
     uint64_t evicted_phys = g_slots[slot].evicted_physical_dev;
     uint64_t vdev = g_slots[slot].virtual_dev_id;
@@ -2109,11 +2729,14 @@ int main(void) {
     int32_t userId=-1, fgUser=-1; int ret;
 
     ghostpad_status_log_reset();
-    gp_log("Ghost-Control EasySMX X10 + wired DS4 v1 candidate starting - %d slots\n",
+    gp_log("Ghost-Control EasySMX X10 + wired DS4 v1 + Xbox 360 wireless candidate starting - %d slots\n",
            MAX_SLOTS);
-    notify("Ghost-Control: X10 + wired DS4 v1 candidate");
+    notify("Ghost-Control: X10 + wired DS4 v1 + Xbox 360 wireless candidate");
 
-    wait_for_previous_instance();
+    if (wait_for_previous_instance() != 0) {
+        notify("Ghost-Control: existing payload did not stop - replacement aborted");
+        return 1;
+    }
     { int pfd=open(PID_PATH,O_WRONLY|O_CREAT|O_TRUNC,0600);
       if(pfd>=0){char pb[16];snprintf(pb,sizeof(pb),"%d",getpid());write(pfd,pb,strlen(pb));close(pfd);}
     }
